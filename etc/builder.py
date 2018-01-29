@@ -1,12 +1,12 @@
 from iocbuilder import Device
 from iocbuilder.arginfo import makeArgInfo, Simple
 
-__all__ = ['ExcaliburDetector']
+__all__ = ['ExcaliburProcessPlugin']
 
 
-class ExcaliburDetector(Device):
+class ExcaliburProcessPlugin(Device):
 
-    """Store configuration for Excalibur Detector."""
+    """Store configuration for ExcaliburProcessPlugin."""
 
     NAME = "excalibur"
 
