@@ -9,6 +9,7 @@ import re
 from tornado.escape import json_decode
 from odin.adapters.adapter import ApiAdapter, ApiAdapterResponse, request_types, response_types
 from excalibur.detector import ExcaliburDetector, ExcaliburDetectorError
+from excalibur.hl_detector import HLExcaliburDetector
 
 
 def require_valid_detector(func):
@@ -47,7 +48,7 @@ class ExcaliburAdapter(ApiAdapter):
         if 'detector_fems' in self.options:
             fems = [tuple(fem.strip().split(':')) for fem in self.options['detector_fems'].split(',')]
             try:
-                self.detector = ExcaliburDetector(fems)
+                self.detector = HLExcaliburDetector(fems)
                 logging.debug('ExcaliburAdapter loaded')
                 
                 if 'powercard_fem_idx' in self.options:
@@ -74,8 +75,7 @@ class ExcaliburAdapter(ApiAdapter):
                 logging.error('ExcaliburAdapter failed to initialise detector: %s', e)
         else:
             logging.warning('No detector FEM option specified in configuration')
-            
-            
+
     @request_types('application/json')
     @response_types('application/json', default='application/json')
     @require_valid_detector
@@ -110,6 +110,7 @@ class ExcaliburAdapter(ApiAdapter):
         :param request: Tornado HTTP request object
         :return: ApiAdapterResponse object to be returned to the client
         """
+        logging.debug("%s", request.body)
         try:
             data = json_decode(request.body)
             self.detector.set(path, data)
