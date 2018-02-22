@@ -7,7 +7,12 @@ class ExcaliburDefinitions(object):
     ALL_FEMS = 0
     ALL_CHIPS = 0
 
-    FEM_PIXELS_PER_CHIP = 256 * 256
+    X_PIXELS_PER_CHIP = 256
+    Y_PIXELS_PER_CHIP = 256
+    X_CHIPS_PER_FEM = 8
+    Y_CHIPS_PER_FEM = 1
+
+    FEM_PIXELS_PER_CHIP = X_PIXELS_PER_CHIP * Y_PIXELS_PER_CHIP
 
     FEM_TRIGMODE_INTERNAL = 0
     FEM_TRIGMODE_EXTERNAL = 1
@@ -39,6 +44,10 @@ class ExcaliburDefinitions(object):
     FEM_GAIN_MODE_LGM = 2
     FEM_GAIN_MODE_SLGM = 3
     FEM_GAIN_MODE_NAMES = ('SHGM', 'HGM', 'LGM', 'SLGM')
+
+    FEM_TEST_PULSE_DISABLE = 0
+    FEM_TEST_PULSE_ENABLE = 1
+    FEM_TEST_PULSE_NAMES = ('disable', 'enable')
 
     FEM_OPERATION_MODE_NORMAL = 0
     FEM_OPERATION_MODE_BURST = 1
