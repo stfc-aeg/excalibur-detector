@@ -138,10 +138,13 @@ class HLExcaliburDetector(ExcaliburDetector):
         self.source_data_mac = [u'62:00:00:00:00:01']
         self.source_data_port = [8]
         self.dest_data_addr = [u'10.0.2.1']
-        self.dest_data_mac = [u'00:07:43:06:31:A7']
+#        self.dest_data_mac = [u'00:07:43:06:31:A7']
+#        self.dest_data_mac = [u'A0:36:9F:8C:52:3C']
+        self.dest_data_mac = [u'00:07:43:11:F7:60', u'A0:36:9F:8C:52:3C']
         self.dest_data_port = [61649]
         # TODO: Hardcoded 2 fems, this needs updating
-        self._fems = [1, 2]
+        self._fems = range(1, len(fem_connections)+1)
+        logging.debug("Fem conection IDs: %s", self._fems)
 
         # Create the calibration object
         self._cb = DetectorCalibration()
@@ -149,8 +152,11 @@ class HLExcaliburDetector(ExcaliburDetector):
         # Create the Excalibur parameters
         self._param = {
             'config/num_images': IntegerParameter('num_images', 1),
-            'config/acquisition_time': IntegerParameter('acquisition_time', 1000),
+            'config/exposure_time': DoubleParameter('exposure_time', 1.0),
             'config/num_test_pulses': IntegerParameter('num_test_pulses', 0),
+            'config/test_pulse_enable': EnumParameter('test_pulse_enable',
+                                                      ExcaliburDefinitions.FEM_TEST_PULSE_NAMES[0],
+                                                   ExcaliburDefinitions.FEM_TEST_PULSE_NAMES),
             'config/operation_mode': EnumParameter('operation_mode',
                                                    ExcaliburDefinitions.FEM_OPERATION_MODE_NAMES[0],
                                                    ExcaliburDefinitions.FEM_OPERATION_MODE_NAMES),
@@ -193,13 +199,67 @@ class HLExcaliburDetector(ExcaliburDetector):
             #                                                                     "DAC Scan",
             #                                                                     "Matrix Read"])
         }
-        self._status = {}
-        self._update_time = datetime.now()
+        self._status = {
+            'calibration': [0] * len(self._fems),
+            'sensor': {
+                'width': ExcaliburDefinitions.X_PIXELS_PER_CHIP * ExcaliburDefinitions.X_CHIPS_PER_FEM,
+                'height': ExcaliburDefinitions.Y_PIXELS_PER_CHIP *
+                          ExcaliburDefinitions.Y_CHIPS_PER_FEM * len(self._fems)
+            },
+            'manufacturer': 'DLS/STFC',
+            'model': 'Odin [Excalibur2]',
+            'error': ''
+        }
+        logging.debug("Status: %s", self._status)
+        self._calibration_status = {
+            'dac': [0] * len(self._fems),
+            'discl': [0] * len(self._fems),
+            'disch': [0] * len(self._fems),
+            'mask': [0] * len(self._fems),
+            'thresh': [0] * len(self._fems)
+        }
+
+        self._executing_updates = True
+        self._acquiring = False
+        self._acq_frame_count = 0
+        self._acq_exposure = 0.0
+        self._acq_start_time = datetime.now()
+        self._acq_timeout = 0.0
+        self._comms_lock = threading.RLock()
+        self._param_lock = threading.RLock()
+        self._fast_update_time = datetime.now()
+        self._slow_update_time = datetime.now()
+        self._frame_start_count = 0
+        self._frame_count_time = None
         self._status_thread = threading.Thread(target=self.status_loop)
-        #self._status_thread.start()
+        self._status_thread.start()
+
+    def shutdown(self):
+        self._executing_updates = False
+
+    def set_calibration_status(self, fem, status, area=None):
+        if area is not None:
+            self._calibration_status[area][fem-1] = status
+        else:
+            for area in ['dac', 'discl', 'disch', 'mask', 'thresh']:
+                self._calibration_status[area][fem - 1] = status
+
+        logging.error("Calibration: %s", self._calibration_status)
+        bit = 0
+        calibration_bitmask = 0
+        for area in ['dac', 'discl', 'disch', 'mask', 'thresh']:
+            calibration_bitmask += (self._calibration_status[area][fem - 1] << bit)
+            bit += 1
+        if calibration_bitmask == 0x1F:
+            calibration_bitmask += (1 << bit)
+
+        self._status['calibration'][fem-1] = calibration_bitmask
 
     def update_calibration(self, name, value):
         logging.debug("Updating calibration due to %s updated to %s", name, value)
+        # Reset all calibration status values prior to loading a new calibration
+        for fem in self._fems:
+            self.set_calibration_status(fem, 0)
         self._cb.set_file_root(self._param['config/cal_file_root'].value)
         self._cb.set_csm_spm_mode(self._param['config/csm_spm_mode'].index)
         self._cb.set_gain_mode(self._param['config/gain_mode'].index)
@@ -207,29 +267,22 @@ class HLExcaliburDetector(ExcaliburDetector):
         self._cb.load_calibration_files(self._fems)
         self.download_dac_calibration()
         self.download_pixel_calibration()
+        logging.error("Status: %s", self._status)
 
     def download_dac_calibration(self):
         dac_params = []
         chip_ids = [1, 2, 3, 4, 5, 6, 7, 8]
 
-        #            logging.debug("%s", self._cb.get_dac(1))
         for (dac_name, dac_param) in self._cb.get_dac(1).dac_api_params():
             logging.debug("%s  %s", dac_name, dac_param)
-#
             dac_vals = []
-#            for (fem_id, fem_idx) in zip(fem_ids, fem_idxs):
             for fem in self._fems:
-    #
-
                 fem_vals = [self._cb.get_dac(fem).dacs(fem, chip_id)[dac_name] for chip_id in chip_ids]
                 dac_vals.append(fem_vals)
 
             dac_params.append(ExcaliburParameter(dac_param, dac_vals,
                                                  fem=self._fems, chip=chip_ids))
 
-#        dac_params.append(ExcaliburParameter('mpx3_dacsense', [[self.args.sense_dac]],
-#                                             fem=self.args.config_fem, chip=self.args.config_chip))
-#
         # Connect to the hardware
         self.connect({'state': True})
 
@@ -239,16 +292,9 @@ class HLExcaliburDetector(ExcaliburDetector):
         logging.info('Writing DAC configuration parameters to system {}'.format(str(dac_params)))
         self.write_fe_param(dac_params)
 
-    #        write_ok = self.client.fe_param_write(dac_params)
-#        if not write_ok:
-#            logging.error('Failed to write DAC parameters for FEM ID {}, chip ID {}'.format(fem_id, chip_id))
-#            return
-#
-#        load_ok = self.client.do_command('load_dacconfig', self.args.config_fem, self.args.config_chip)
-#        if load_ok:
-#            logging.info('DAC load completed OK')
-#        else:
-#            logging.error('Failed to execute DAC load command: {}'.format(self.client.error_msg))
+        for fem in self._fems:
+            self.set_calibration_status(fem, 1, 'dac')
+            self.set_calibration_status(fem, 1, 'thresh')
 
     def download_pixel_calibration(self):
         chip_ids = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -283,32 +329,71 @@ class HLExcaliburDetector(ExcaliburDetector):
 
         # Write all the parameters to system
         self.write_fe_param(pixel_params)
+        for fem in self._fems:
+            self.set_calibration_status(fem, 1, 'mask')
+            self.set_calibration_status(fem, 1, 'discl')
+            self.set_calibration_status(fem, 1, 'disch')
 
     def status_loop(self):
-        while True:
-            if (datetime.now() - self._update_time).seconds > 5.0:
-                self._update_time = datetime.now()
+        # Status loop has two polling rates, fast and slow
+        # Fast poll is currently set to 0.2 s
+        # Slow poll is currently set to 5.0 s
+        while self._executing_updates:
+            if (datetime.now() - self._slow_update_time).seconds > 5.0:
+                self._slow_update_time = datetime.now()
                 self.slow_read()
+            if (datetime.now() - self._fast_update_time).microseconds > 100000:
+                self._fast_update_time = datetime.now()
+                self.fast_read()
+            time.sleep(0.1)
 
     def get(self, path):
-        if path in self._param:
-            response = self._param[path].get()
-        elif self.search_status(path) is not None:
-            response = {'value': self.search_status(path)}
-        else:
-            response = super(HLExcaliburDetector, self).get(path)
+        with self._param_lock:
+            if path == 'command/initialise':
+                response = {'value': 1}
+            elif path in self._param:
+                response = self._param[path].get()
+            elif self.search_status(path) is not None:
+                response = {'value': self.search_status(path)}
+                try:
+                    response.update(super(HLExcaliburDetector, self).get(path))
+                except:
+                    # Valid to fail if the get request is for a high level item
+                    pass
+            else:
+                response = super(HLExcaliburDetector, self).get(path)
 
-        return response
+            return response
 
     def set(self, path, data):
-        if path in self._param:
-            self._param[path].set_value(data)
-        elif path == 'command/start_acquisition':
-            # Starting an acquisition!
-            logging.debug('Start acquisition has been called')
-            self.do_acquisition()
-        else:
-            super(HLExcaliburDetector, self).set(path, data)
+        try:
+            if path in self._param:
+                self._param[path].set_value(data)
+            elif path == 'command/initialise':
+                # Initialise the FEMs
+                logging.error('Initialise has been called')
+                self.hl_initialise()
+            elif path == 'command/start_acquisition':
+                # Starting an acquisition!
+                logging.debug('Start acquisition has been called')
+                self.do_acquisition()
+            elif path == 'command/stop_acquisition':
+                # Starting an acquisition!
+                logging.debug('Abort acquisition has been called')
+                self.do_command('stop_acquisition', None)
+            else:
+                super(HLExcaliburDetector, self).set(path, data)
+        except Exception as ex:
+            self.set_error(str(ex))
+            raise ExcaliburDetectorError(str(ex))
+
+    def set_error(self, err):
+        # Record the error message into the status
+        self._status['error'] = err
+
+    def clear_error(self):
+        # Record the error message into the status
+        self._status['error'] = ""
 
     def search_status(self, path):
         items = path.split('/')
@@ -341,37 +426,111 @@ class HLExcaliburDetector(ExcaliburDetector):
     #             self.error_msg = 'Command {} failed on {} FEMs'.format(cmd, fem_error_count)
     #         break
 
-    def slow_read(self):
+    def fast_read(self):
+        status = {}
+        frame_rate = 0.0
+        with self._comms_lock:
+            acq_completion_state_mask = 0x40000000
+            # Connect to the hardware
+            if not self.connected:
+                self.connect({'state': True})
 
-        # Connect to the hardware
-        if not self.connected:
-            self.connect({'state': True})
+            fem_params = ['frames_acquired', 'control_state']
 
-        # Wait
-        time.sleep(1.0)
+            read_params = ExcaliburReadParameter(fem_params)
+            self.read_fe_param(read_params)
 
-        fem_params = ['fem_local_temp', 'fem_remote_temp', 'moly_temp', 'moly_humidity']
-        supply_params = ['supply_p1v5_avdd1', 'supply_p1v5_avdd2', 'supply_p1v5_avdd3', 'supply_p1v5_avdd4',
-                        'supply_p1v5_vdd1', 'supply_p2v5_dvdd1']
-
-        fe_params = fem_params + supply_params + ['mpx3_dac_out']
-
-        read_params = ExcaliburReadParameter(fe_params)
-        self.read_fe_param(read_params)
-
-        while True:
-            logging.info("Waiting....")
-            time.sleep(0.1)
-            if not self.command_pending():
-                if self._get('command_succeeded'):
-                    logging.info("Command has succeeded")
+            while True:
+                time.sleep(0.01)
+                if not self.command_pending():
+                    if self._get('command_succeeded'):
+                        logging.info("Command has succeeded")
+                    else:
+                        logging.info("Command has failed")
+                    break
+            vals = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read']['value']
+            logging.info("Raw fast read status: %s", vals)
+            # Calculate the minimum number of frames from the fems, as this will be the actual complete frame count
+            frames_acquired = min(vals['frames_acquired'])
+            #acq_completed = all(
+            #    [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]
+            #)
+            if self._acquiring:
+                # We are acquiring so check to see if we have the correct number of frames
+                if frames_acquired == self._acq_frame_count:
+                    self._acquiring = False
+                    # Acquisition has finished so we must send the stop command
+                    logging.debug("stop_acquisition called at end of a complete acquisition")
+                    self.hl_stop_acquisition()
+                elif frames_acquired > self._acq_frame_count:
+                    # There has been an error in the acquisition, we should never have too many frames
+                    self._acquiring = False
+                    # Acquisition has finished so we must send the stop command
+                    logging.debug("stop_acquisition called at end of a complete acquisition")
+                    self.hl_stop_acquisition()
                 else:
-                    logging.info("Command has failed")
-                break
-        self._status.update(super(HLExcaliburDetector, self).get('command')['command']['fe_param_read']['value'])
-        logging.info("Results: %s", self._status)
+                    if frames_acquired > 0:
+                        if self._frame_count_time is None:
+                            self._frame_start_count = frames_acquired
+                            self._frame_count_time = datetime.now()
+                        # Check to see if we have timed out
+                        delta_us = (datetime.now() - self._frame_count_time).microseconds
+                        delta_s = (datetime.now() - self._frame_count_time).seconds
+                        frame_rate = float(frames_acquired-self._frame_start_count) / (float(delta_s) + (float(delta_us) / 1000000.0))
+                    else:
+                        self._frame_start_count = 0
+                        self._frame_count_time = None
+                        frame_rate = 0.0
+                    #logging.error("Current frame rate %f", frame_rate)
+                    delta_t = (datetime.now() - self._acq_start_time).seconds
+                    # Work out the worst case for number of expected frames (assuming 10% plus 1 second startup)
+                    delta_t -= 1.0
+                    if delta_t > 0.0:
+                        expected_frames = int(delta_t / (self._acq_exposure * 1.1))
+                        #logging.error("We would have expected %d frames by now", expected_frames)
+                        if expected_frames > frames_acquired:
+                            self._acquiring = False
+                            # Acquisition has finished so we must send the stop command
+                            logging.debug("stop_acquisition called due to a timeout")
+                            self.hl_stop_acquisition()
 
+            status = {'frames_acquired': frames_acquired,
+                      'frame_rate': frame_rate,
+                      'acquisition_complete': (not self._acquiring)}
+        with self._param_lock:
+            self._status.update(status)
+        logging.info("Fast update status: %s", status)
 
+    def slow_read(self):
+        status = {}
+        with self._comms_lock:
+            # Do not perform a slow read if an acquisition is taking place
+            if not self._acquiring:
+                # Connect to the hardware
+                if not self.connected:
+                    self.connect({'state': True})
+
+                fem_params = ['fem_local_temp', 'fem_remote_temp', 'moly_temp', 'moly_humidity']
+                supply_params = ['supply_p1v5_avdd1', 'supply_p1v5_avdd2', 'supply_p1v5_avdd3', 'supply_p1v5_avdd4',
+                                'supply_p1v5_vdd1', 'supply_p2v5_dvdd1']
+
+                fe_params = fem_params + supply_params + ['mpx3_dac_out']
+
+                read_params = ExcaliburReadParameter(fe_params)
+                self.read_fe_param(read_params)
+
+                while True:
+                    time.sleep(0.1)
+                    if not self.command_pending():
+                        if self._get('command_succeeded'):
+                            logging.info("Command has succeeded")
+                        else:
+                            logging.info("Command has failed")
+                        break
+                status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read']['value']
+        with self._param_lock:
+            self._status.update(status)
+        logging.debug("Slow update status: %s", status)
 
     # def exec_command(self, cmd, params=None):
     #
@@ -420,137 +579,204 @@ class HLExcaliburDetector(ExcaliburDetector):
     #     return (succeeded, response.json())
 
     def do_acquisition(self):
-        # Resolve the acquisition operating mode appropriately, handling burst and matrix read if necessary
-        operation_mode = self._param['config/operation_mode']
+        with self._comms_lock:
+            self.clear_error()
+            if self._status['frames_acquired'] > 0:
+                self.set_error('Detector reports non zero frames, reset detector')
+                return
+            # Set the acquiring flag
+            self._acquiring = True
+            self._acq_start_time = datetime.now()
+            status = {'acquisition_complete': (not self._acquiring)}
+            self._status.update(status)
+            # Resolve the acquisition operating mode appropriately, handling burst and matrix read if necessary
+            operation_mode = self._param['config/operation_mode']
 
-        # if self.args.burst_mode:
-        #     operation_mode = ExcaliburDefinitions.FEM_OPERATION_MODE_BURST
-        #
-        # if self.args.matrixread:
-        #     if self.args.burst_mode:
-        #         logging.warning('Cannot select burst mode and matrix read simultaneously, ignoring burst option')
-        #     operation_mode = ExcaliburDefinitions.FEM_OPERATION_MODE_MAXTRIXREAD
-        #
-        # # TODO - handle 24 bit readout here - needs to check frame count etc and execute C0 read
+            # if self.args.burst_mode:
+            #     operation_mode = ExcaliburDefinitions.FEM_OPERATION_MODE_BURST
+            #
+            # if self.args.matrixread:
+            #     if self.args.burst_mode:
+            #         logging.warning('Cannot select burst mode and matrix read simultaneously, ignoring burst option')
+            #     operation_mode = ExcaliburDefinitions.FEM_OPERATION_MODE_MAXTRIXREAD
+            #
+            # # TODO - handle 24 bit readout here - needs to check frame count etc and execute C0 read
 
-        # Build a list of parameters to be written to the system to set up acquisition
-        write_params = []
+            # Build a list of parameters to be written to the system to set up acquisition
+            write_params = []
 
-        tp_count = self._param['config/num_test_pulses'].value
-        logging.info('  Setting test pulse count to {}'.format(tp_count))
-        write_params.append(ExcaliburParameter('mpx3_numtestpulses', [[tp_count]]))
-        tp_enable = 1 if tp_count != 0 else 0
-        write_params.append(ExcaliburParameter('testpulse_enable', [[tp_enable]]))
+            tp_count = self._param['config/num_test_pulses'].value
+            logging.info('  Setting test pulse count to {}'.format(tp_count))
+            write_params.append(ExcaliburParameter('mpx3_numtestpulses', [[tp_count]]))
+            tp_enable = self._param['config/test_pulse_enable']
+            logging.info('  Setting test pulse enable to {}'.format(tp_enable.value))
+            write_params.append(ExcaliburParameter('testpulse_enable', [[tp_enable.index]]))
 
-        num_frames = self._param['config/num_images'].value
-        logging.info('  Setting number of frames to {}'.format(num_frames))
-        write_params.append(ExcaliburParameter('num_frames_to_acquire', [[num_frames]]))
+            num_frames = self._param['config/num_images'].value
+            logging.info('  Setting number of frames to {}'.format(num_frames))
+            write_params.append(ExcaliburParameter('num_frames_to_acquire', [[num_frames]]))
 
-        acquisition_time = self._param['config/acquisition_time'].value
-        logging.info('  Setting acquisition time to {} ms'.format(acquisition_time))
-        write_params.append(ExcaliburParameter('acquisition_time', [[acquisition_time]]))
+            # Record the number of frames for this acquisition
+            self._acq_frame_count = num_frames
 
-        trigger_mode = self._param['config/trigger_mode']
-        logging.info('  Setting trigger mode to {}'.format(trigger_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_externaltrigger', [[trigger_mode.index]]))
+            # Record the acquisition exposure time
+            self._acq_exposure = self._param['config/exposure_time'].value
 
-        read_write_mode = self._param['config/read_write_mode']
-        logging.info('  Setting ASIC readout mode to {}'.format(read_write_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_readwritemode', [[read_write_mode.index]]))
+            acquisition_time = int(self._param['config/exposure_time'].value * 1000.0)
+            logging.info('  Setting acquisition time to {} ms'.format(acquisition_time))
+            write_params.append(ExcaliburParameter('acquisition_time', [[acquisition_time]]))
 
-        colour_mode = self._param['config/colour_mode']
-        logging.info('  Setting ASIC colour mode to {} '.format(colour_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_colourmode', [[colour_mode.index]]))
+            trigger_mode = self._param['config/trigger_mode']
+            logging.info('  Setting trigger mode to {}'.format(trigger_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_externaltrigger', [[trigger_mode.index]]))
 
-        csmspm_mode = self._param['config/csm_spm_mode']
-        logging.info('  Setting ASIC pixel mode to {} '.format(csmspm_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_csmspmmode', [[csmspm_mode.index]]))
+            read_write_mode = self._param['config/read_write_mode']
+            logging.info('  Setting ASIC readout mode to {}'.format(read_write_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_readwritemode', [[read_write_mode.index]]))
 
-        disc_csm_spm = self._param['config/disc_csm_spm']
-        logging.info('  Setting ASIC discriminator output mode to {} '.format(disc_csm_spm.value))
-        write_params.append(ExcaliburParameter('mpx3_disccsmspm', [[disc_csm_spm.index]]))
+            colour_mode = self._param['config/colour_mode']
+            logging.info('  Setting ASIC colour mode to {} '.format(colour_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_colourmode', [[colour_mode.index]]))
 
-        equalization_mode = self._param['config/equalization_mode']
-        logging.info('  Setting ASIC equalization mode to {} '.format(equalization_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_equalizationmode', [[equalization_mode.index]]))
+            csmspm_mode = self._param['config/csm_spm_mode']
+            logging.info('  Setting ASIC pixel mode to {} '.format(csmspm_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_csmspmmode', [[csmspm_mode.index]]))
 
-        gain_mode = self._param['config/gain_mode']
-        logging.info('  Setting ASIC gain mode to {} '.format(gain_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_gainmode', [[gain_mode.index]]))
+            disc_csm_spm = self._param['config/disc_csm_spm']
+            logging.info('  Setting ASIC discriminator output mode to {} '.format(disc_csm_spm.value))
+            write_params.append(ExcaliburParameter('mpx3_disccsmspm', [[disc_csm_spm.index]]))
 
-        counter_select = self._param['config/counter_select'].value
-        logging.info('  Setting ASIC counter select to {} '.format(counter_select))
-        write_params.append(ExcaliburParameter('mpx3_counterselect', [[counter_select]]))
+            equalization_mode = self._param['config/equalization_mode']
+            logging.info('  Setting ASIC equalization mode to {} '.format(equalization_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_equalizationmode', [[equalization_mode.index]]))
 
-        counter_depth = self._param['config/counter_depth'].value
-        logging.info('  Setting ASIC counter depth to {} bits'.format(counter_depth))
-        write_params.append(ExcaliburParameter('mpx3_counterdepth',
-                                               [[ExcaliburDefinitions.FEM_COUNTER_DEPTH_MAP[counter_depth]]]))
+            gain_mode = self._param['config/gain_mode']
+            logging.info('  Setting ASIC gain mode to {} '.format(gain_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_gainmode', [[gain_mode.index]]))
 
-        logging.info('  Setting operation mode to {}'.format(operation_mode.value))
-        write_params.append(ExcaliburParameter('mpx3_operationmode', [[operation_mode.index]]))
+            counter_select = self._param['config/counter_select'].value
+            logging.info('  Setting ASIC counter select to {} '.format(counter_select))
+            write_params.append(ExcaliburParameter('mpx3_counterselect', [[counter_select]]))
 
-        lfsr_bypass = self._param['config/lfsr_bypass']
-        logging.info('  Setting LFSR bypass mode to {}'.format(lfsr_bypass.value))
-        write_params.append(ExcaliburParameter('mpx3_lfsrbypass', [[lfsr_bypass.index]]))
+            counter_depth = self._param['config/counter_depth'].value
+            logging.info('  Setting ASIC counter depth to {} bits'.format(counter_depth))
+            write_params.append(ExcaliburParameter('mpx3_counterdepth',
+                                                   [[ExcaliburDefinitions.FEM_COUNTER_DEPTH_MAP[counter_depth]]]))
 
-        #
-        # if self.args.matrixread:
-        #     lfsr_bypass_mode = ExcaliburDefinitions.FEM_LFSR_BYPASS_MODE_ENABLED
-        # else:
-        #     lfsr_bypass_mode = ExcaliburDefinitions.FEM_LFSR_BYPASS_MODE_DISABLED
-        #
-        logging.info('  Setting data interface address and port parameters')
-        write_params.append(ExcaliburParameter('source_data_addr', [[addr] for addr in self.source_data_addr]))
-        write_params.append(ExcaliburParameter('source_data_mac', [[mac] for mac in self.source_data_mac]))
-        write_params.append(ExcaliburParameter('source_data_port', [[port] for port in self.source_data_port]))
-        write_params.append(ExcaliburParameter('dest_data_addr', [[addr] for addr in self.dest_data_addr]))
-        write_params.append(ExcaliburParameter('dest_data_mac', [[mac] for mac in self.dest_data_mac]))
-        write_params.append(ExcaliburParameter('dest_data_port', [[port] for port in self.dest_data_port]))
+            logging.info('  Setting operation mode to {}'.format(operation_mode.value))
+            write_params.append(ExcaliburParameter('mpx3_operationmode', [[operation_mode.index]]))
 
-        logging.info('  Disabling local data receiver thread')
-        write_params.append(ExcaliburParameter('datareceiver_enable', [[0]]))
+            lfsr_bypass = self._param['config/lfsr_bypass']
+            logging.info('  Setting LFSR bypass mode to {}'.format(lfsr_bypass.value))
+            write_params.append(ExcaliburParameter('mpx3_lfsrbypass', [[lfsr_bypass.index]]))
 
-        # Connect to the hardware
-        self.connect({'state': True})
+            #
+            # if self.args.matrixread:
+            #     lfsr_bypass_mode = ExcaliburDefinitions.FEM_LFSR_BYPASS_MODE_ENABLED
+            # else:
+            #     lfsr_bypass_mode = ExcaliburDefinitions.FEM_LFSR_BYPASS_MODE_DISABLED
+            #
+            logging.info('  Setting data interface address and port parameters')
+            write_params.append(ExcaliburParameter('source_data_addr', [[addr] for addr in self.source_data_addr]))
+            write_params.append(ExcaliburParameter('source_data_mac', [[mac] for mac in self.source_data_mac]))
+            write_params.append(ExcaliburParameter('source_data_port', [[port] for port in self.source_data_port]))
+            write_params.append(ExcaliburParameter('dest_data_addr', [[addr] for addr in self.dest_data_addr]))
+            write_params.append(ExcaliburParameter('dest_data_mac', [[mac] for mac in self.dest_data_mac]))
+            write_params.append(ExcaliburParameter('dest_data_port', [[port] for port in self.dest_data_port]))
 
-        # Write all the parameters to system
-        logging.info('Writing configuration parameters to system {}'.format(str(write_params)))
-        self.write_fe_param(write_params)
+            logging.info('  Disabling local data receiver thread')
+            write_params.append(ExcaliburParameter('datareceiver_enable', [[0]]))
 
-        # Send start acquisition command
-        logging.info('Sending start acquisition command')
-        # cmd_ok = self.client.do_command('start_acquisition')
-        # if not cmd_ok:
-        #     logging.error('start_acquisition command failed: {}'.format(self.client.error_msg))
-        #     return
-        #
-        # # If the nowait arguments wasn't given, monitor the acquisition state until all requested frames
-        # # have been read out by the system
-        # if not self.args.no_wait:
-        #
-        #     wait_count = 0
-        #     acq_completion_state_mask = 0x40000000
-        #     frames_acquired = 0
-        #
-        #     while True:
-        #
-        #         (read_ok, vals) = self.client.fe_param_read(['frames_acquired', 'control_state'])
-        #         frames_acquired = min(vals['frames_acquired'])
-        #         acq_completed = all(
-        #             [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]
-        #         )
-        #         if acq_completed:
-        #             break
-        #
-        #         wait_count += 1
-        #         if wait_count % 5 == 0:
-        #             logging.info('  {:d} frames read out  ...'.format(frames_acquired))
-        #
-        #     logging.info('Completed readout of {} frames'.format(frames_acquired))
-        #     self.do_stop()
-        #     logging.info('Acquisition complete')
-        # else:
-        #     logging.info('Acquisition started, not waiting for completion, will not send stop command')
+            # Connect to the hardware
+            # self.connect({'state': True})
+
+            # Write all the parameters to system
+            logging.info('Writing configuration parameters to system {}'.format(str(write_params)))
+            self.hl_write_params(write_params)
+
+            self._frame_start_count = 0
+            self._frame_count_time = None
+
+            # Send start acquisition command
+            logging.info('Sending start acquisition command')
+            self.do_command('start_acquisition', params=None)
+            # if not cmd_ok:
+            #     logging.error('start_acquisition command failed: {}'.format(self.client.error_msg))
+            #     return
+            #
+            # # If the nowait arguments wasn't given, monitor the acquisition state until all requested frames
+            # # have been read out by the system
+            # if not self.args.no_wait:
+            #
+            #     wait_count = 0
+            #     acq_completion_state_mask = 0x40000000
+            #     frames_acquired = 0
+            #
+            #     while True:
+            #
+            #         (read_ok, vals) = self.client.fe_param_read(['frames_acquired', 'control_state'])
+            #         frames_acquired = min(vals['frames_acquired'])
+            #         acq_completed = all(
+            #             [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]
+            #         )
+            #         if acq_completed:
+            #             break
+            #
+            #         wait_count += 1
+            #         if wait_count % 5 == 0:
+            #             logging.info('  {:d} frames read out  ...'.format(frames_acquired))
+            #
+            #     logging.info('Completed readout of {} frames'.format(frames_acquired))
+            #     self.do_stop()
+            #     logging.info('Acquisition complete')
+            # else:
+            #     logging.info('Acquisition started, not waiting for completion, will not send stop command')
 
 #    def read_ini_file(self):
+
+    def hl_initialise(self):
+        self.do_command('fe_init', params=None)
+        return self.wait_for_completion()
+
+    def hl_stop_acquisition(self):
+        self.do_command('stop_acquisition', None)
+        return self.wait_for_completion()
+
+    def hl_write_params(self, params):
+        self.write_fe_param(params)
+        return self.wait_for_completion()
+
+    def get_fem_error_state(self):
+        fem_state = self.get('status/fem')['fem']
+        logging.debug("%s", fem_state)
+        for (idx, state) in enumerate(fem_state):
+            yield (idx, state['id'], state['error_code'], state['error_msg'])
+
+    def wait_for_completion(self):
+        succeeded = False
+        err_msg = ''
+        try:
+            while True:
+                time.sleep(0.1)
+                if not self.get('status/command_pending')['command_pending']:
+                    succeeded = self.get('status/command_succeeded')['command_succeeded']
+                    if succeeded:
+                        pass
+                    else:
+                        logging.error('Command write_fe_param failed on following FEMS:')
+                        fem_error_count = 0
+                        for (idx, fem_id, error_code, error_msg) in self.get_fem_error_state():
+                            if error_code != 0:
+                                logging.error(
+                                    '  FEM idx {} id {} : {} : {}'.format(idx, fem_id, error_code, error_msg))
+                                fem_error_count += 1
+                        err_msg = 'Command write_fe_param failed on {} FEMs'.format(fem_error_count)
+                    break
+
+        except ExcaliburDetectorError as e:
+            err_msg = str(e)
+
+        if not succeeded:
+            self.set_error(err_msg)
+
+        return succeeded, err_msg
