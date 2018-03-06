@@ -110,6 +110,7 @@ class ExcaliburAdapter(ApiAdapter):
         :param request: Tornado HTTP request object
         :return: ApiAdapterResponse object to be returned to the client
         """
+        logging.error("%s", path)
         logging.debug("%s", request.body)
         try:
             data = json_decode(request.body)
@@ -146,3 +147,6 @@ class ExcaliburAdapter(ApiAdapter):
 
         return ApiAdapterResponse(response, status_code=status_code)
 
+    def cleanup(self):
+        if self.detector:
+            self.detector.shutdown()
