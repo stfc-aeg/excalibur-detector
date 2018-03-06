@@ -255,6 +255,20 @@ class HLExcaliburDetector(ExcaliburDetector):
 
         self._status['calibration'][fem-1] = calibration_bitmask
 
+    def hl_manual_dac_calibration(self, filename):
+        for fem in self._fems:
+            self.set_calibration_status(fem, 0, 'dac')
+        self._cb.manual_dac_calibration(self._fems, filename)
+        self.download_dac_calibration()
+        logging.error("Status: %s", self._status)
+
+    def hl_manual_mask_calibration(self, filename):
+        for fem in self._fems:
+            self.set_calibration_status(fem, 0, 'mask')
+        self._cb.manual_mask_calibration(self._fems, filename)
+        self.download_pixel_masks()
+        logging.error("Status: %s", self._status)
+
     def update_calibration(self, name, value):
         logging.debug("Updating calibration due to %s updated to %s", name, value)
         # Reset all calibration status values prior to loading a new calibration
@@ -295,6 +309,22 @@ class HLExcaliburDetector(ExcaliburDetector):
         for fem in self._fems:
             self.set_calibration_status(fem, 1, 'dac')
             self.set_calibration_status(fem, 1, 'thresh')
+
+    def download_pixel_masks(self):
+        chip_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        pixel_params = []
+        mpx3_pixel_masks = []
+        logging.debug("Generating mpx3_pixel_mask...")
+        for fem in self._fems:
+            fem_vals = [self._cb.get_mask(fem)[chip-1].pixels for chip in chip_ids]
+            mpx3_pixel_masks.append(fem_vals)
+        pixel_params.append(ExcaliburParameter('mpx3_pixel_mask', mpx3_pixel_masks,
+                                               fem=self._fems, chip=chip_ids))
+
+        # Write all the parameters to system
+        self.write_fe_param(pixel_params)
+        for fem in self._fems:
+            self.set_calibration_status(fem, 1, 'mask')
 
     def download_pixel_calibration(self):
         chip_ids = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -351,6 +381,10 @@ class HLExcaliburDetector(ExcaliburDetector):
         with self._param_lock:
             if path == 'command/initialise':
                 response = {'value': 1}
+            elif path == 'command/configure_dac':
+                response = {'value': 1}
+            elif path == 'command/configure_mask':
+                response = {'value': 1}
             elif path in self._param:
                 response = self._param[path].get()
             elif self.search_status(path) is not None:
@@ -373,6 +407,14 @@ class HLExcaliburDetector(ExcaliburDetector):
                 # Initialise the FEMs
                 logging.error('Initialise has been called')
                 self.hl_initialise()
+            elif path == 'command/configure_dac':
+                # Initialise the FEMs
+                logging.error('Manual DAC calibration has been called')
+                self.hl_manual_dac_calibration(data)
+            elif path == 'command/configure_mask':
+                # Initialise the FEMs
+                logging.error('Manual mask file download has been called')
+                self.hl_manual_mask_calibration(data)
             elif path == 'command/start_acquisition':
                 # Starting an acquisition!
                 logging.debug('Start acquisition has been called')
