@@ -186,6 +186,7 @@ class ExcaliburPixelConfigParser(object):
                     self._pixels.extend([int(val) for val in line.strip().split(' ')])
         except Exception as e:
             logging.error('Failed to parse pixel configuration mask file: {}'.format(e))
+            raise IOError('Failed to parse pixel configuration mask file: {}'.format(e))
 
     @property
     def pixels(self):

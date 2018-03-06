@@ -126,16 +126,36 @@ class DetectorCalibration(object):
             self._thresh0[fems] = self.load_threshold_calibration_file(fems, 0)
             self._thresh1[fems] = self.load_threshold_calibration_file(fems, 1)
 
-    def load_dac_calibration_file(self, fem):
-        filename = self.cal_file_root(fem) + 'dacs'
+    def manual_dac_calibration(self, fems, filename):
+        if isinstance(fems, list):
+            for fem in fems:
+                self._dacs[fem] = self.load_dac_calibration_file(fem, filename)
+        else:
+            self._dacs[fems] = self.load_dac_calibration_file(fems, filename)
+
+    def manual_mask_calibration(self, fems, filename):
+        if isinstance(fems, list):
+            for fem in fems:
+                self._masks[fem] = self.load_pixel_calibration_file(fem, self.FILE_PIXEL_MASK, self.CHIPS, filename)
+        else:
+            self._masks[fems] = self.load_pixel_calibration_file(fems, self.FILE_PIXEL_MASK, self.CHIPS, filename)
+
+    def load_dac_calibration_file(self, fem, filename=None):
+        if filename is None:
+            filename = self.cal_file_root(fem) + 'dacs'
         return ExcaliburDacConfigParser([filename], [fem], [1, 2, 3, 4, 5, 6, 7, 8])
 
-    def load_pixel_calibration_file(self, fem, type, chips):
-        filename = self.cal_file_root(fem) + type
+    def load_pixel_calibration_file(self, fem, type, chips, filename=None):
         config = []
-        for chip in chips:
-            config.append(ExcaliburPixelConfigParser(filename + str(chip-1)))
-            logging.debug("Pixel file loaded for chip %d => %s...", chip, config[chip-1].pixels[0:20])
+        if filename is None:
+            filename = self.cal_file_root(fem) + type
+            for chip in chips:
+                config.append(ExcaliburPixelConfigParser(filename + str(chip-1)))
+                logging.debug("Pixel file loaded for chip %d => %s...", chip, config[chip-1].pixels[0:20])
+        else:
+            for chip in chips:
+                config.append(ExcaliburPixelConfigParser(filename))
+                logging.debug("Pixel file loaded for chip %d => %s...", chip, config[chip - 1].pixels[0:20])
         return config
 
     def load_threshold_calibration_file(self, fem, threshold):
