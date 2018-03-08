@@ -928,12 +928,14 @@ class HLExcaliburDetector(ExcaliburDetector):
         self.hl_write_params(params)
 
     def hl_stop_acquisition(self):
-        self.do_command('stop_acquisition', None)
-        return self.wait_for_completion()
+        with self._comms_lock:
+            self.do_command('stop_acquisition', None)
+            return self.wait_for_completion()
 
     def hl_write_params(self, params):
-        self.write_fe_param(params)
-        return self.wait_for_completion()
+        with self._comms_lock:
+            self.write_fe_param(params)
+            return self.wait_for_completion()
 
     def get_fem_error_state(self):
         fem_state = self.get('status/fem')['fem']
