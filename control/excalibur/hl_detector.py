@@ -4,6 +4,7 @@ interface_wrapper.py - EXCALIBUR high level API for the ODIN server.
 Alan Greer, DLS
 """
 import logging
+import json
 from datetime import datetime
 import time
 import threading
@@ -134,15 +135,14 @@ class HLExcaliburDetector(ExcaliburDetector):
         super(HLExcaliburDetector, self).__init__(fem_connections)
 
         # Temporary setup of MAC addresses
-        self.source_data_addr = [u'10.0.2.2']
-        self.source_data_mac = [u'62:00:00:00:00:01']
-        self.source_data_port = [8]
-        self.dest_data_addr = [u'10.0.2.1']
+#        self.source_data_addr = [u'10.0.2.2']
+#        self.source_data_mac = [u'62:00:00:00:00:01']
+#        self.source_data_port = [8]
+#        self.dest_data_addr = [u'10.0.2.1']
 #        self.dest_data_mac = [u'00:07:43:06:31:A7']
 #        self.dest_data_mac = [u'A0:36:9F:8C:52:3C']
-        self.dest_data_mac = [u'00:07:43:11:F7:60', u'A0:36:9F:8C:52:3C']
-        self.dest_data_port = [61649]
-        # TODO: Hardcoded 2 fems, this needs updating
+#        self.dest_data_mac = [u'00:07:43:11:F7:60', u'A0:36:9F:8C:52:3C']
+#        self.dest_data_port = [61649]
         self._fems = range(1, len(fem_connections)+1)
         logging.debug("Fem conection IDs: %s", self._fems)
 
@@ -151,6 +151,7 @@ class HLExcaliburDetector(ExcaliburDetector):
 
         # Create the Excalibur parameters
         self._param = {
+            'api': DoubleParameter('api', 0.1),
             'config/num_images': IntegerParameter('num_images', 1),
             'config/exposure_time': DoubleParameter('exposure_time', 1.0),
             'config/num_test_pulses': IntegerParameter('num_test_pulses', 0),
@@ -191,7 +192,9 @@ class HLExcaliburDetector(ExcaliburDetector):
                                                   '12',
                                                   ['1', '6', '12', '24']),
             'config/cal_file_root': StringParameter('cal_file_root', '', callback=self.update_calibration),
-            'config/energy_threshold': StringParameter('energy_threshold', 0.0, callback=self.update_calibration)
+            'config/energy_threshold': DoubleParameter('energy_threshold', 0.0, callback=self.update_calibration),
+            'config/udp_file': StringParameter('udp_file', '', callback=self.hl_load_udp_config),
+            'config/hv_bias': DoubleParameter('hv_bias', 0.0, callback=self.hl_hv_bias_set),
 
             #["Normal",
             #                                                                     "Burst",
@@ -228,11 +231,95 @@ class HLExcaliburDetector(ExcaliburDetector):
         self._comms_lock = threading.RLock()
         self._param_lock = threading.RLock()
         self._fast_update_time = datetime.now()
+        self._medium_update_time = datetime.now()
         self._slow_update_time = datetime.now()
         self._frame_start_count = 0
         self._frame_count_time = None
         self._status_thread = threading.Thread(target=self.status_loop)
         self._status_thread.start()
+
+    def hl_load_udp_config(self, name, filename):
+        logging.error("Loading UDP configuration [{}] from file {}".format(name, filename))
+
+        try:
+            with open(filename) as config_file:
+                udp_config = json.load(config_file)
+        except IOError as io_error:
+            logging.error("Failed to open UDP configuration file: {}".format(io_error))
+            return
+        except ValueError as value_error:
+            logging.error("Failed to parse UDP json config: {}".format(value_error))
+            return
+
+        source_data_addr = []
+        source_data_mac = []
+        source_data_port = []
+        dest_data_port_offset = []
+
+        for idx, fem in enumerate(udp_config['fems']):
+            source_data_addr.append(fem['ipaddr'])
+            source_data_mac.append(fem['mac'])
+            source_data_port.append(fem['port'])
+            dest_data_port_offset.append(fem['dest_port_offset']
+                                         )
+            logging.error('    FEM  {:d} : ip {:16s} mac: {:s} port: {:5d} offset: {:d}'.format(
+                idx, source_data_addr[-1], source_data_mac[-1],
+                source_data_port[-1], dest_data_port_offset[-1]
+            ))
+
+        dest_data_addr = []
+        dest_data_mac = []
+        dest_data_port = []
+
+        for idx, node in enumerate(udp_config['nodes']):
+            dest_data_addr.append(node['ipaddr'])
+            dest_data_mac.append(node['mac'])
+            dest_data_port.append(int(node['port']))
+
+            logging.debug('    Node {:d} : ip {:16s} mac: {:s} port: {:5d}'.format(
+                idx, dest_data_addr[-1], dest_data_mac[-1],
+                dest_data_port[-1]
+            ))
+
+        farm_mode_enable = udp_config['farm_mode']['enable']
+        farm_mode_num_dests = udp_config['farm_mode']['num_dests']
+
+        udp_params = []
+        num_fems = len(self._fems)
+        # Append per-FEM UDP source parameters, truncating to number of FEMs present in system
+        udp_params.append(ExcaliburParameter(
+            'source_data_addr', [[addr] for addr in source_data_addr[:num_fems]],
+        ))
+        udp_params.append(ExcaliburParameter(
+            'source_data_mac', [[mac] for mac in source_data_mac[:num_fems]],
+        ))
+        udp_params.append(ExcaliburParameter(
+            'source_data_port', [[port] for port in source_data_port[:num_fems]]
+        ))
+        udp_params.append(ExcaliburParameter(
+            'dest_data_port_offset',
+            [[offset] for offset in dest_data_port_offset[:num_fems]]
+        ))
+
+        # Append the UDP destination parameters, noting [[[ ]]] indexing as they are common for
+        # all FEMs and chips - there must be a better way to do this
+        udp_params.append(ExcaliburParameter(
+            'dest_data_addr', [[[addr for addr in dest_data_addr]]]
+        ))
+        udp_params.append(ExcaliburParameter(
+            'dest_data_mac', [[[mac for mac in dest_data_mac]]]
+        ))
+        udp_params.append(ExcaliburParameter(
+            'dest_data_port', [[[port for port in dest_data_port]]]
+        ))
+
+        # Append the farm mode configuration parameters
+        udp_params.append(ExcaliburParameter('farm_mode_enable', [[farm_mode_enable]]))
+        udp_params.append(ExcaliburParameter('farm_mode_num_dests', [[farm_mode_num_dests]]))
+
+        # Write all the parameters to system
+        logging.info('Writing UDP configuration parameters to system')
+        self.hl_write_params(udp_params)
 
     def shutdown(self):
         self._executing_updates = False
@@ -372,6 +459,9 @@ class HLExcaliburDetector(ExcaliburDetector):
             if (datetime.now() - self._slow_update_time).seconds > 5.0:
                 self._slow_update_time = datetime.now()
                 self.slow_read()
+            if (datetime.now() - self._medium_update_time).seconds > 10.0:
+                self._medium_update_time = datetime.now()
+                self.power_card_read()
             if (datetime.now() - self._fast_update_time).microseconds > 100000:
                 self._fast_update_time = datetime.now()
                 self.fast_read()
@@ -380,6 +470,10 @@ class HLExcaliburDetector(ExcaliburDetector):
     def get(self, path):
         with self._param_lock:
             if path == 'command/initialise':
+                response = {'value': 1}
+            elif path == 'command/lv_enable':
+                response = {'value': 1}
+            elif path == 'command/hv_enable':
                 response = {'value': 1}
             elif path == 'command/configure_dac':
                 response = {'value': 1}
@@ -407,6 +501,14 @@ class HLExcaliburDetector(ExcaliburDetector):
                 # Initialise the FEMs
                 logging.error('Initialise has been called')
                 self.hl_initialise()
+            elif path == 'command/lv_enable':
+                # Disable/Enable the low voltage
+                logging.error('lv_enable has been called')
+                self.hl_lv_enable(data)
+            elif path == 'command/hv_enable':
+                # Disable/Enable the low voltage
+                logging.error('hv_enable has been called')
+                self.hl_hv_enable(data)
             elif path == 'command/configure_dac':
                 # Initialise the FEMs
                 logging.error('Manual DAC calibration has been called')
@@ -448,25 +550,6 @@ class HLExcaliburDetector(ExcaliburDetector):
             except KeyError, ex:
                 item_dict = None
         return item_dict
-
-    # def
-    #
-    #     state = response.json()['status']
-    #
-    #     if not state['command_pending']:
-    #         succeeded = state['command_succeeded']
-    #         if succeeded:
-    #             response = requests.get(self.url + 'command/' + cmd)
-    #         else:
-    #             self.logger.error('Command {} failed on following FEMS:'.format(cmd))
-    #             fem_error_count = 0
-    #             for (idx, fem_id, error_code, error_msg) in self.get_fem_error_state():
-    #                 if error_code != 0:
-    #                     self.logger.error('  FEM idx {} id {} : {} : {}'.format(idx, fem_id, error_code, error_msg))
-    #                     fem_error_count += 1
-    #             self.error_code = ExcaliburDefinitions.ERROR_FEM
-    #             self.error_msg = 'Command {} failed on {} FEMs'.format(cmd, fem_error_count)
-    #         break
 
     def fast_read(self):
         status = {}
@@ -541,7 +624,73 @@ class HLExcaliburDetector(ExcaliburDetector):
                       'acquisition_complete': (not self._acquiring)}
         with self._param_lock:
             self._status.update(status)
-        logging.info("Fast update status: %s", status)
+        logging.debug("Fast update status: %s", status)
+
+    def power_card_read(self):
+        with self._comms_lock:
+            # Do not perform a slow read if an acquisition is taking place
+            if not self._acquiring:
+                # Connect to the hardware
+                if not self.connected:
+                    self.connect({'state': True})
+
+                powercard_params = ['fe_lv_enable',
+                                    'fe_hv_enable',
+                                    'pwr_p5va_vmon',
+                                    'pwr_p5vb_vmon',
+                                    'pwr_p5v_fem00_imon',
+                                    'pwr_p5v_fem01_imon',
+                                    'pwr_p5v_fem02_imon',
+                                    'pwr_p5v_fem03_imon',
+                                    'pwr_p5v_fem04_imon',
+                                    'pwr_p5v_fem05_imon',
+                                    'pwr_p48v_vmon',
+                                    'pwr_p48v_imon',
+                                    'pwr_p5vsup_vmon',
+                                    'pwr_p5vsup_imon',
+                                    'pwr_humidity_mon',
+                                    'pwr_air_temp_mon',
+                                    'pwr_coolant_temp_mon',
+                                    'pwr_coolant_flow_mon',
+                                    'pwr_p3v3_imon',
+                                    'pwr_p1v8_imonA',
+                                    'pwr_bias_imon',
+                                    'pwr_p3v3_vmon',
+                                    'pwr_p1v8_vmon',
+                                    'pwr_bias_vmon',
+                                    'pwr_p1v8_imonB',
+                                    'pwr_p1v8_vmonB',
+                                    'pwr_coolant_temp_status',
+                                    'pwr_humidity_status',
+                                    'pwr_coolant_flow_status',
+                                    'pwr_air_temp_status',
+                                    'pwr_fan_fault']
+                fe_params = powercard_params
+                read_params = ExcaliburReadParameter(fe_params, fem=self.powercard_fem_idx+1)
+                self.read_fe_param(read_params)
+
+                while True:
+                    time.sleep(0.1)
+                    if not self.command_pending():
+                        if self._get('command_succeeded'):
+                            logging.info("Command has succeeded")
+                            status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read'][
+                                'value']
+                            with self._param_lock:
+                                for param in powercard_params:
+                                    if param in status:
+                                        val = status[param]
+                                        if isinstance(val, list):
+                                            self._status[param] = val[0]
+                                        else:
+                                            self._status[param] = val
+                        else:
+                            logging.error("Command has failed")
+                            with self._param_lock:
+                                for param in powercard_params:
+                                    self._status[param] = None
+                        break
+        logging.debug("Power card update status: %s", self._status)
 
     def slow_read(self):
         status = {}
@@ -566,59 +715,30 @@ class HLExcaliburDetector(ExcaliburDetector):
                     if not self.command_pending():
                         if self._get('command_succeeded'):
                             logging.info("Command has succeeded")
+                            status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read'][
+                                'value']
+                            with self._param_lock:
+                                for param in fe_params:
+                                    if param in status:
+                                        val = []
+                                        if param in supply_params:
+                                            for item in status[param]:
+                                                if item != 1:
+                                                    val.append(0)
+                                                else:
+                                                    val.append(1)
+                                        else:
+                                            val = status[param]
+                                        self._status[param] = val
                         else:
                             logging.info("Command has failed")
+                            with self._param_lock:
+                                for param in fe_params:
+                                    if param in status:
+                                        self._status[param] = status[param]
                         break
-                status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read']['value']
-        with self._param_lock:
-            self._status.update(status)
-        logging.debug("Slow update status: %s", status)
 
-    # def exec_command(self, cmd, params=None):
-    #
-    #     self.logger.debug('Executing command: {}'.format(cmd))
-    #
-    #     payload = {cmd: params}
-    #     response = requests.put(self.url + 'command', data=json.dumps(payload), headers=self.request_headers)
-    #
-    #     succeeded = False
-    #
-    #     if response.status_code == requests.codes.ok:
-    #
-    #         while True:
-    #             time.sleep(self.cmd_completion_poll_interval)
-    #             response = requests.get(self.url + 'status')
-    #             state = response.json()['status']
-    #
-    #             if not ######state['command_pending']:
-    #                 succeeded = state['command_succeeded']
-    #                 if succeeded:
-    #                     response = requests.get(self.url + 'command/' + cmd)
-    #                 else:
-    #                     self.logger.error('Command {} failed on following FEMS:'.format(cmd))
-    #                     fem_error_count = 0
-    #                     for (idx, fem_id, error_code, error_msg) in self.get_fem_error_state():
-    #                         if error_code != 0:
-    #                             self.logger.error(
-    #                                 '  FEM idx {} id {} : {} : {}'.format(idx, fem_id, error_code, error_msg))
-    #                             fem_error_count += 1
-    #                     self.error_code = ExcaliburDefinitions.ERROR_FEM
-    #                     self.error_msg = 'Command {} failed on {} FEMs'.format(cmd, fem_error_count)
-    #                 break
-    #
-    #     else:
-    #         self.error_code = ExcaliburDefinitions.ERROR_REQUEST
-    #         if 'error' in response.json():
-    #             self.error_msg = response.json()['error']
-    #         else:
-    #             self.error_msg = 'unknown error'
-    #
-    #         self.error_msg = 'Command {} request failed with code {}: {}'.format(
-    #             cmd, response.status_code, self.error_msg)
-    #
-    #         self.logger.error(self.error_msg)
-    #
-    #     return (succeeded, response.json())
+        logging.debug("Slow update status: %s", status)
 
     def do_acquisition(self):
         with self._comms_lock:
@@ -718,13 +838,13 @@ class HLExcaliburDetector(ExcaliburDetector):
             # else:
             #     lfsr_bypass_mode = ExcaliburDefinitions.FEM_LFSR_BYPASS_MODE_DISABLED
             #
-            logging.info('  Setting data interface address and port parameters')
-            write_params.append(ExcaliburParameter('source_data_addr', [[addr] for addr in self.source_data_addr]))
-            write_params.append(ExcaliburParameter('source_data_mac', [[mac] for mac in self.source_data_mac]))
-            write_params.append(ExcaliburParameter('source_data_port', [[port] for port in self.source_data_port]))
-            write_params.append(ExcaliburParameter('dest_data_addr', [[addr] for addr in self.dest_data_addr]))
-            write_params.append(ExcaliburParameter('dest_data_mac', [[mac] for mac in self.dest_data_mac]))
-            write_params.append(ExcaliburParameter('dest_data_port', [[port] for port in self.dest_data_port]))
+            #logging.info('  Setting data interface address and port parameters')
+            #write_params.append(ExcaliburParameter('source_data_addr', [[addr] for addr in self.source_data_addr]))
+            #write_params.append(ExcaliburParameter('source_data_mac', [[mac] for mac in self.source_data_mac]))
+            #write_params.append(ExcaliburParameter('source_data_port', [[port] for port in self.source_data_port]))
+            #write_params.append(ExcaliburParameter('dest_data_addr', [[addr] for addr in self.dest_data_addr]))
+            #write_params.append(ExcaliburParameter('dest_data_mac', [[mac] for mac in self.dest_data_mac]))
+            #write_params.append(ExcaliburParameter('dest_data_port', [[port] for port in self.dest_data_port]))
 
             logging.info('  Disabling local data receiver thread')
             write_params.append(ExcaliburParameter('datareceiver_enable', [[0]]))
@@ -779,6 +899,33 @@ class HLExcaliburDetector(ExcaliburDetector):
     def hl_initialise(self):
         self.do_command('fe_init', params=None)
         return self.wait_for_completion()
+
+    def hl_lv_enable(self, lv_enable):
+
+        if self.powercard_fem_idx <= 0:
+            self.set_error("Unable to set LV enable as server reports no power card")
+            return
+        params = []
+        params.append(ExcaliburParameter('fe_lv_enable', [[lv_enable]], fem=self.powercard_fem_idx+1))
+        self.hl_write_params(params)
+
+    def hl_hv_enable(self, hv_enable):
+
+        if self.powercard_fem_idx <= 0:
+            self.set_error("Unable to set HV enable as server reports no power card")
+            return
+        params = []
+        params.append(ExcaliburParameter('fe_hv_enable', [[hv_enable]], fem=self.powercard_fem_idx+1))
+        self.hl_write_params(params)
+
+    def hl_hv_bias_set(self, name, value):
+        if self.powercard_fem_idx <= 0:
+            self.set_error("Unable to set HV bias [] as server reports no power card".format(name))
+            return
+
+        params = []
+        params.append(ExcaliburParameter('fe_hv_bias', [[value]], fem=self.powercard_fem_idx+1))
+        self.hl_write_params(params)
 
     def hl_stop_acquisition(self):
         self.do_command('stop_acquisition', None)
