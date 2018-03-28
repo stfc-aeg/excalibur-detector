@@ -23,10 +23,12 @@ namespace Excalibur {
     static const size_t num_primary_packets[num_bit_depths] = { 4, 32, 65, 65 };
     static const size_t max_primary_packets = 65;
     static const size_t tail_packet_size[num_bit_depths] = { 768, 6152, 4296, 4296 };
+    static const size_t num_tail_packets = 1;
 
-    static const size_t num_tail_packets       = 1;
-    static const size_t num_subframes          = 2;
-    static const size_t max_num_fems           = 6;
+    static const size_t num_subframes[num_bit_depths] = {2, 2, 2, 4};
+    static const size_t max_num_subframes = 4;
+
+    static const size_t max_num_fems = 6;
 
     static const uint32_t start_of_frame_mask = 1 << 31;
     static const uint32_t end_of_frame_mask   = 1 << 30;
@@ -50,7 +52,7 @@ namespace Excalibur {
       uint32_t packets_received;
       uint8_t  sof_marker_count;
       uint8_t  eof_marker_count;
-      uint8_t  packet_state[num_subframes][max_primary_packets + num_tail_packets];
+      uint8_t  packet_state[max_num_subframes][max_primary_packets + num_tail_packets];
     } FemReceiveState;
 
     typedef struct
@@ -76,14 +78,14 @@ namespace Excalibur {
 
     inline const std::size_t max_frame_size(void)
     {
-      std::size_t max_frame_size = (subframe_size(bitDepth24) * num_subframes * max_num_fems)
-           + sizeof(FrameHeader);
+      std::size_t max_frame_size = sizeof(FrameHeader) +
+          (subframe_size(bitDepth24) * num_subframes[bitDepth24] * max_num_fems);
       return max_frame_size;
     }
 
     inline const std::size_t num_fem_frame_packets(const AsicCounterBitDepth bit_depth)
     {
-      std::size_t num_fem_frame_packets = num_subframes *
+      std::size_t num_fem_frame_packets = num_subframes[bit_depth] *
           (num_primary_packets[bit_depth] + num_tail_packets);
       return num_fem_frame_packets;
     }

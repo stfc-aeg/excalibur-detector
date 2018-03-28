@@ -1,6 +1,8 @@
 /*
  * ExcaliburFrameDecoder.cpp
  *
+ * ODIN data frame decoder plugin for EXCALIBUR detector UDP frame data.
+ *
  *  Created on: Jan 16th, 2017
  *      Author: Tim Nicholls, STFC Application Engineering Group
  */
@@ -19,10 +21,10 @@ using namespace FrameReceiver;
 const std::string ExcaliburFrameDecoder::asic_bit_depth_str_[Excalibur::num_bit_depths] =
     {"1-bit", "6-bit", "12-bit", "24-bit"};
 
-#define MAX_IGNORED_PACKET_REPORTS 10
+const std::string ExcaliburFrameDecoder::CONFIG_FEM_PORT_MAP = "fem_port_map";
+const std::string ExcaliburFrameDecoder::CONFIG_BITDEPTH = "bitdepth";
 
-static void* last_buffer_addr = NULL;
-static bool first_tp_found = false;
+#define MAX_IGNORED_PACKET_REPORTS 10
 
 //! Constructor for ExcaliburFrameDecoder
 //!
@@ -32,6 +34,7 @@ static bool first_tp_found = false;
 ExcaliburFrameDecoder::ExcaliburFrameDecoder() :
     FrameDecoderUDP(),
     asic_counter_bit_depth_(Excalibur::bitDepth12),
+    num_subframes_(Excalibur::num_subframes[asic_counter_bit_depth_]),
     current_frame_seen_(Excalibur::default_frame_number),
     current_frame_buffer_id_(Excalibur::default_frame_number),
     current_frame_buffer_(0),
@@ -39,9 +42,7 @@ ExcaliburFrameDecoder::ExcaliburFrameDecoder() :
     num_active_fems_(0),
     dropping_frame_data_(false),
     packets_ignored_(0),
-    has_subframe_trailer_(true),
-    last_shadow_frame_number_(0),
-    current_shadow_frame_number_(0)
+    has_subframe_trailer_(true)
 {
 
   // Allocate buffers for packet header, dropped frames and scratched packets
@@ -69,7 +70,7 @@ ExcaliburFrameDecoder::~ExcaliburFrameDecoder()
 void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config_msg)
 {
 
-  // Pass the configuratin message to the base class decoder
+  // Pass the configuration message to the base class decoder
   FrameDecoder::init(logger, config_msg);
 
   LOG4CXX_DEBUG_LEVEL(2, logger_, "Got decoder config message: " << config_msg.encode());
@@ -78,21 +79,20 @@ void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config
   // present, use the default. If the map cannot be parsed correctly, thrown an exception to signal
   // an error to the app controller. Set the current number of active FEMs based on the output
   // of the map parsing.
-  std::string fem_port_map_config_str;
-  if (config_msg.has_param("fem_port_map"))
+  if (config_msg.has_param(CONFIG_FEM_PORT_MAP))
   {
+      fem_port_map_str_ = config_msg.get_param<std::string>(CONFIG_FEM_PORT_MAP);
       LOG4CXX_DEBUG_LEVEL(1, logger_, "Parsing FEM to port map found in config: "
-                          << config_msg.get_param<std::string>("fem_port_map"));
-      fem_port_map_config_str = config_msg.get_param<std::string>("fem_port_map");
+                          << fem_port_map_str_);
   }
   else
   {
       LOG4CXX_DEBUG_LEVEL(1,logger_, "No FEM to port map found in config, using default: "
                           << default_fem_port_map);
-      fem_port_map_config_str = default_fem_port_map;
+      fem_port_map_str_ = default_fem_port_map;
   }
 
-  num_active_fems_ = parse_fem_port_map(fem_port_map_config_str);
+  num_active_fems_ = parse_fem_port_map(fem_port_map_str_);
   if (num_active_fems_)  {
       LOG4CXX_DEBUG_LEVEL(1, logger_, "Parsed " << num_active_fems_
                           << " entries from port map configuration");
@@ -103,9 +103,9 @@ void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config
   }
 
   // Extract the ASIC counter bit depth from the config message
-  if (config_msg.has_param("bitdepth"))
+  if (config_msg.has_param(CONFIG_BITDEPTH))
   {
-    std::string bit_depth_str = config_msg.get_param<std::string>("bitdepth");
+    std::string bit_depth_str = config_msg.get_param<std::string>(CONFIG_BITDEPTH);
 
     Excalibur::AsicCounterBitDepth bit_depth =
         parse_bit_depth(bit_depth_str);
@@ -124,6 +124,11 @@ void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config
   LOG4CXX_DEBUG_LEVEL(1, logger_, "Setting ASIC counter bit depth to "
       << asic_bit_depth_str_[asic_counter_bit_depth_]);
 
+  // Set the number of subframes in this readout mode, as it is used frequently
+  num_subframes_ = Excalibur::num_subframes[asic_counter_bit_depth_];
+  LOG4CXX_DEBUG_LEVEL(1, logger_, "Setting number of subframes for this bit depth to "
+      <<num_subframes_);
+
   // Determine if this readout mode has a subframe trailer
   if (asic_counter_bit_depth_ == Excalibur::bitDepth1)
   {
@@ -133,8 +138,6 @@ void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config
   {
     has_subframe_trailer_ = true;
   }
-  // Reset shadow frame counter
-  last_shadow_frame_number_ = 0;
 
   // Print a packet logger header to the appropriate logger if enabled
   if (enable_packet_logging_)
@@ -153,29 +156,81 @@ void ExcaliburFrameDecoder::init(LoggerPtr& logger, OdinData::IpcMessage& config
   packets_ignored_ = 0;
 }
 
+void ExcaliburFrameDecoder::request_configuration(const std::string param_prefix,
+    OdinData::IpcMessage& config_reply)
+{
+
+  // Call the base class method to populate parameters
+  FrameDecoder::request_configuration(param_prefix, config_reply);
+
+  // Add current configuration parameters to reply
+  config_reply.set_param(param_prefix + CONFIG_FEM_PORT_MAP, fem_port_map_str_);
+  config_reply.set_param(param_prefix + CONFIG_BITDEPTH, asic_bit_depth_str_[asic_counter_bit_depth_]);
+
+}
+
+//! Get the size of the frame buffers required for current operation mode.
+//!
+//! This method returns the frame buffer size required for the current operation mode, which is
+//! determined by subframe size based on bit depth, number of subframes and active FEMs.
+//!
+//! \return size of frame buffer in bytes
+//!
 const size_t ExcaliburFrameDecoder::get_frame_buffer_size(void) const
 {
   size_t frame_buffer_size = get_frame_header_size() +
-      (Excalibur::subframe_size(asic_counter_bit_depth_) * Excalibur::num_subframes * num_active_fems_);
+      (Excalibur::subframe_size(asic_counter_bit_depth_) * num_subframes_ * num_active_fems_);
   return frame_buffer_size;
 }
 
+//! Get the size of the frame header.
+//!
+//! This method returns the size of the frame header used by the decoder, which in this case is the
+//! EXCALIBUR frame header.
+//!
+//! \return size of the frame header in bytes
 const size_t ExcaliburFrameDecoder::get_frame_header_size(void) const
 {
   return sizeof(Excalibur::FrameHeader);
 }
 
+//! Get the size of a packet header.
+//!
+//! This method returns the size of a UDP packet header for the receiver thread, which in this case
+//! is the size of the EXCALIBUR packet header.
+//!
+//! \return size of the packet header in bytes.
+//!
 const size_t ExcaliburFrameDecoder::get_packet_header_size(void) const
 {
   return sizeof(Excalibur::PacketHeader);
 }
 
-void*
-ExcaliburFrameDecoder::get_packet_header_buffer(void)
+//! Get a pointer to the packet header buffer.
+//!
+//! This method returns a pointer to the next packet header buffer. For this decoder, the packet
+//! headers are discarded, so the current packet header is always returned.
+//!
+//! \return pointer to the packet header buffer
+//!
+void* ExcaliburFrameDecoder::get_packet_header_buffer(void)
 {
   return current_packet_header_.get();
 }
 
+//! Process an incoming packet header
+//!
+//! This method is called to process an incoming packet header that has been received. The source
+//! and content of that header is used to determine where to route the payload of the packet to on
+//! the next receive. Header information is used to determine which frame buffer the current packet
+//! should be routed to, and to request a new frame buffer when the first packet of a given frame
+//! is received. Buffer exhaustion is also handler by directing all packets for the current frame
+//! to a scratch buffer.
+//!
+//! \param[in] bytes_received - number of header bytes received
+//! \param[in] port - UDP port packet header was received on
+//! \param[in] from_addr - socket address structure with details of source of packet
+//!
 void ExcaliburFrameDecoder::process_packet_header(size_t bytes_received, int port,
     struct sockaddr_in* from_addr)
 {
@@ -226,8 +281,8 @@ void ExcaliburFrameDecoder::process_packet_header(size_t bytes_received, int por
   bool start_of_frame_marker = get_start_of_frame_marker ();
   bool end_of_frame_marker = get_end_of_frame_marker ();
 
-  uint32_t subframe_idx = subframe_counter % 2;
-  int frame = static_cast<int> (subframe_counter / 2);
+  uint32_t subframe_idx = subframe_counter % num_subframes_;
+  int frame = static_cast<int> (subframe_counter / num_subframes_);
 
   LOG4CXX_DEBUG_LEVEL(3, logger_, "Got packet header:" << " packet: " << packet_number
       << " subframe ctr: " << subframe_counter
@@ -236,7 +291,7 @@ void ExcaliburFrameDecoder::process_packet_header(size_t bytes_received, int por
       << " port: " << port << " fem idx: " << current_packet_fem_map_.fem_idx_
   );
 
-  // Only handle the packet header and frame logic further is this packet is not being ignored
+  // Only handle the packet header and frame logic further if this packet is not being ignored
   if (current_packet_fem_map_.fem_idx_ != ILLEGAL_FEM_IDX)
   {
     if (frame != current_frame_seen_)
@@ -282,17 +337,12 @@ void ExcaliburFrameDecoder::process_packet_header(size_t bytes_received, int por
         current_frame_header_ = reinterpret_cast<Excalibur::FrameHeader*>(current_frame_buffer_);
         initialise_frame_header(current_frame_header_);
 
-        // Track shadow frame counter for the current frame
-        current_shadow_frame_number_ = last_shadow_frame_number_++;
-        shadow_frame_counter_map[current_frame_seen_] = current_shadow_frame_number_;
-
       }
       else
       {
         current_frame_buffer_id_ = frame_buffer_map_[current_frame_seen_];
         current_frame_buffer_ = buffer_manager_->get_buffer_address(current_frame_buffer_id_);
         current_frame_header_ = reinterpret_cast<Excalibur::FrameHeader*>(current_frame_buffer_);
-        current_shadow_frame_number_ = shadow_frame_counter_map[current_frame_seen_];
       }
 
     }
@@ -320,23 +370,16 @@ void ExcaliburFrameDecoder::process_packet_header(size_t bytes_received, int por
 
 //! Initialise a frame header
 //!
-//! This method initialises the frame header specifed by the pointer argument, setting
+//! This method initialises the frame header specified by the pointer argument, setting
 //! fields to their default values, clearing packet counters and setting the active FEM
 //! fields as appropriate.
 //!
-//! \param[in] - header_ptr - pointer to frame header to initialise.
+//! \param[in] header_ptr - pointer to frame header to initialise.
 //!
 void ExcaliburFrameDecoder::initialise_frame_header(Excalibur::FrameHeader* header_ptr)
 {
 
-#ifdef USE_SUBFRAME_TRAILER_COUNTER
-  // Initialise the frame number to -1 so we can pick this up from the first
-  // subframe trailer seen in the packet stream
-  header_ptr->frame_number = Excalibur::default_frame_number;
-#else
   header_ptr->frame_number = current_frame_seen_;
-#endif
-
   header_ptr->frame_state = FrameDecoder::FrameReceiveStateIncomplete;
   header_ptr->total_packets_received = 0;
   header_ptr->total_sof_marker_count = 0;
@@ -355,6 +398,15 @@ void ExcaliburFrameDecoder::initialise_frame_header(Excalibur::FrameHeader* head
 
 }
 
+//! Get a pointer to the next payload buffer.
+//!
+//! This method returns a pointer to the next packet payload buffer within the appropriate frame.
+//! The location of this is determined by state information set during the processing of the packet
+//! header. If thepacket is not from a recognised FEM, a pointer to the ignored packet buffer will
+//! be returned instead.
+//!
+//! \return pointer to the next payload buffer
+//!
 void* ExcaliburFrameDecoder::get_next_payload_buffer(void) const
 {
 
@@ -363,11 +415,12 @@ void* ExcaliburFrameDecoder::get_next_payload_buffer(void) const
   if (current_packet_fem_map_.fem_idx_ != ILLEGAL_FEM_IDX)
   {
     std::size_t subframe_size = Excalibur::subframe_size(asic_counter_bit_depth_);
+    std::size_t num_subframes = Excalibur::num_subframes[asic_counter_bit_depth_];
 
     next_receive_location = reinterpret_cast<uint8_t*>(current_frame_buffer_)
           + get_frame_header_size ()
-          + (subframe_size * Excalibur::num_subframes * current_packet_fem_map_.buf_idx_)
-          + (subframe_size * (get_subframe_counter() % 2))
+          + (subframe_size * num_subframes * current_packet_fem_map_.buf_idx_)
+          + (subframe_size * (get_subframe_counter() % num_subframes))
           + (Excalibur::primary_packet_size * get_packet_number());
   }
   else
@@ -378,6 +431,15 @@ void* ExcaliburFrameDecoder::get_next_payload_buffer(void) const
   return reinterpret_cast<void*>(next_receive_location);
 }
 
+//! Get the next packet payload size to receive.
+//!
+//! This method returns the payload size to receive for the next incoming packet, based on state
+//! information set during processing of the header. The receive size may vary depending on
+//! whether a primary or tail packet is being received, the size of both of which is dependent
+//! on the current bit depth.
+//!
+//! \return size of next packet payload in bytes
+//!
 size_t ExcaliburFrameDecoder::get_next_payload_size(void) const
 {
   size_t next_receive_size = 0;
@@ -394,6 +456,17 @@ size_t ExcaliburFrameDecoder::get_next_payload_size(void) const
   return next_receive_size;
 }
 
+//! Process a received packet payload.
+//!
+//! This method processes the payload of a received packet. This is restricted to checking the
+//! subframe trailer if appropriate and keeping track of the number of packets, SOF and EOF markers
+//! etc received. If this packet is the last required to complete a frame, the number of SOF and EOF
+//! markers seen is validated, the frame state is set to complete and the ready callback is called
+//! to notify the main thread that the buffer is ready for processing.
+//!
+//! \param[in] bytes_received - number of packet payload bytes received
+//! \return current frame receive state
+//!
 FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t bytes_received)
 {
 
@@ -409,60 +482,11 @@ FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t byt
 
     if (get_end_of_frame_marker())
     {
-
-      uint32_t frame_number;
-      uint32_t subframe_idx = get_subframe_counter() % 2;
-
-#ifdef USE_SUBFRAME_TRAILER_COUNTER
-
-      if ((asic_counter_bit_depth_ == Excalibur::bitDepth24) &&
-          ((current_shadow_frame_number_ % 2) == 1))
-      {
-        LOG4CXX_DEBUG_LEVEL(3, logger_, "Using current shadow frame number "
-                            << current_shadow_frame_number_ << " for C0 frame in 24-bit mode");
-        frame_number = current_shadow_frame_number_;
-      }
-      else if (has_subframe_trailer_)
-      {
-        size_t payload_bytes_received = bytes_received - sizeof(Excalibur::PacketHeader);
-
-        Excalibur::SubframeTrailer* trailer =
-            reinterpret_cast<Excalibur::SubframeTrailer*>((uint8_t*) get_next_payload_buffer()
-                + payload_bytes_received - sizeof(Excalibur::SubframeTrailer));
-
-        frame_number = static_cast<uint32_t>((trailer->frame_number & 0xFFFFFFFF) - 1);
-        LOG4CXX_DEBUG_LEVEL(3, logger_, "Subframe EOF trailer has frame number = " << frame_number);
-        LOG4CXX_DEBUG_LEVEL(3, logger_, "Current frame seen is: " << current_frame_seen_ );
-      }
-      else
-      {
-        LOG4CXX_DEBUG_LEVEL(3, logger_, "No subframe EOF trailer present in this reaodut mode, "
-                            << "using current shadow frame number: " << current_shadow_frame_number_);
-        frame_number = current_shadow_frame_number_;
-      }
-
-
-      if ((current_frame_header_->frame_number == Excalibur::default_frame_number) &&
-          (subframe_idx == 0))
-      {
-        LOG4CXX_DEBUG_LEVEL(2, logger_, "Updating frame number in header from "
-                            << current_frame_header_->frame_number << " to "
-                            << frame_number);
-        current_frame_header_->frame_number = frame_number;
-      }
-      else
-      {
-        if (frame_number != current_frame_header_->frame_number)
-        {
-          LOG4CXX_WARN(logger_, "Subframe EOF trailer frame number mismatch for frame "
-              << current_frame_seen_ << ": got " << frame_number
-              << " from FEM " << current_packet_fem_map_.fem_idx_
-              << ", expected " << current_frame_header_->frame_number);
-        }
-      }
-#else
       if (has_subframe_trailer_)
       {
+        uint32_t frame_number;
+        uint32_t subframe_idx = get_subframe_counter() % num_subframes_;
+
         size_t payload_bytes_received = bytes_received - sizeof(Excalibur::PacketHeader);
 
         Excalibur::SubframeTrailer* trailer =
@@ -474,19 +498,7 @@ FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t byt
             << current_packet_fem_map_.fem_idx_ << " subframe_idx: " << subframe_idx
             << " frame: " << frame_number
             << " current frame: " << current_frame_header_->frame_number);
-
-#if TEST_SUBFRAME_TRAILER
-
-        if (frame_number != current_frame_header_->frame_number)
-        {
-          LOG4CXX_WARN(logger_, "Subframe EOF trailer frame number mismatch for frame "
-              << current_frame_seen_ << ": got " << frame_number
-              << " from FEM " << current_packet_fem_map_.fem_idx_
-              << ", expected " << current_frame_header_->frame_number);
-        }
-#endif
       }
-#endif
     }
 
     // Get a convenience pointer to the FEM receive state data in the frame header
@@ -506,10 +518,8 @@ FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t byt
       // Check that the appropriate number of SOF and EOF markers (one each per subframe) have
       // been seen, otherwise log a warning
 
-      if ((current_frame_header_->total_sof_marker_count !=
-          (Excalibur::num_subframes * num_active_fems_))
-          || (current_frame_header_->total_eof_marker_count !=
-              (Excalibur::num_subframes * num_active_fems_)))
+      if ((current_frame_header_->total_sof_marker_count != (num_subframes_ * num_active_fems_)) ||
+          (current_frame_header_->total_eof_marker_count != (num_subframes_ * num_active_fems_)))
       {
         LOG4CXX_WARN(logger_, "Incorrect number of SOF ("
            << (int)current_frame_header_->total_sof_marker_count << ") or EOF ("
@@ -528,9 +538,6 @@ FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t byt
         // Erase frame from buffer map
         frame_buffer_map_.erase(current_frame_seen_);
 
-        // Erase counter from shadow frame counter map
-        shadow_frame_counter_map.erase(current_frame_seen_);
-
         // Notify main thread that frame is ready
         ready_callback_(current_frame_buffer_id_, current_frame_header_->frame_number);
 
@@ -543,6 +550,13 @@ FrameDecoder::FrameReceiveState ExcaliburFrameDecoder::process_packet(size_t byt
   return frame_state;
 }
 
+//! Monitor the state of currently mapped frame buffers.
+//!
+//! This method, called periodically by a timer in the receive thread reactor, monitors the state
+//! of currently mapped frame buffers. In any frame buffers have been mapped for a sufficiently
+//! long time that indicates packets have been lost and the frame is incomplete, the frame is
+//! flagged as such and notified to the main thread via the ready callback.
+//!
 void ExcaliburFrameDecoder::monitor_buffers(void)
 {
 
@@ -572,7 +586,6 @@ void ExcaliburFrameDecoder::monitor_buffers(void)
       frames_timedout++;
 
       frame_buffer_map_.erase(buffer_map_iter++);
-      shadow_frame_counter_map.erase(frame_num);
     }
     else
     {
@@ -585,23 +598,41 @@ void ExcaliburFrameDecoder::monitor_buffers(void)
   }
   frames_timedout_ += frames_timedout;
 
-  LOG4CXX_DEBUG_LEVEL(2, logger_,  get_num_mapped_buffers() << " frame buffers in use, "
+  LOG4CXX_DEBUG_LEVEL(3, logger_,  get_num_mapped_buffers() << " frame buffers in use, "
       << get_num_empty_buffers()
       << " empty buffers available, " << frames_timedout_ << " incomplete frames timed out");
 
 }
 
+//! Get the current subframe counter.
+//!
+//! This method extracts and returns the subframe counter from the current UDP packet header.
+//!
+//! \return current subframe counter
+//!
 uint32_t ExcaliburFrameDecoder::get_subframe_counter(void) const
 {
   return reinterpret_cast<Excalibur::PacketHeader*>(current_packet_header_.get())->subframe_counter;
 }
 
+//! Get the current packet number.
+//!
+//! This method extracts and returns the packet number from the current UDP packet header.
+//!
+//! \return current packet number
+//!
 uint32_t ExcaliburFrameDecoder::get_packet_number(void) const
 {
   return reinterpret_cast<Excalibur::PacketHeader*>(
       current_packet_header_.get())->packet_number_flags & Excalibur::packet_number_mask;
 }
 
+//! Get the current packet start of frame (SOF) marker.
+//!
+//! This method extracts and returns the start of frame marker from the current UDP packet header.
+//!
+//! \return true is SOF marker set in packet header
+//!
 bool ExcaliburFrameDecoder::get_start_of_frame_marker(void) const
 {
   uint32_t packet_number_flags =
@@ -609,6 +640,12 @@ bool ExcaliburFrameDecoder::get_start_of_frame_marker(void) const
   return ((packet_number_flags & Excalibur::start_of_frame_mask) != 0);
 }
 
+//! Get the current packet end of frame (EOF) marker.
+//!
+//! This method extracts and returns the end of frame marker from the current UDP packet header.
+//!
+//! \return true is EOF marker set in packet header
+//!
 bool ExcaliburFrameDecoder::get_end_of_frame_marker(void) const
 {
   uint32_t packet_number_flags =
@@ -616,6 +653,15 @@ bool ExcaliburFrameDecoder::get_end_of_frame_marker(void) const
   return ((packet_number_flags & Excalibur::end_of_frame_mask) != 0);
 }
 
+//! Calculate and return an elapsed time in milliseconds.
+//!
+//! This method calculates and returns an elapsed time in milliseconds based on the start and
+//! end timespec structs passed as arguments.
+//!
+//! \param[in] start - start time in timespec struct format
+//! \param[in] end - end time in timespec struct format
+//! \return eclapsed time between start and end in milliseconds
+//!
 unsigned int ExcaliburFrameDecoder::elapsed_ms(struct timespec& start, struct timespec& end)
 {
 
@@ -678,7 +724,7 @@ std::size_t ExcaliburFrameDecoder::parse_fem_port_map(const std::string fem_port
 
 //! Parse the ASIC counter bit depth configuration string.
 //!
-//! This method parses a configurationg string specifying the EXCALIBUR ASIC counter bit
+//! This method parses a configuration string specifying the EXCALIBUR ASIC counter bit
 //! depth currently in use, returning an enumerated constant for use in the decoder.
 //!
 //! \param[in] bit_depth_str - string of the bit depth

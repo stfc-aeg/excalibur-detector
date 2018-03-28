@@ -13,7 +13,6 @@ namespace FrameProcessor
   const std::string ExcaliburProcessPlugin::CONFIG_ASIC_COUNTER_DEPTH = "bitdepth";
   const std::string ExcaliburProcessPlugin::CONFIG_IMAGE_WIDTH = "width";
   const std::string ExcaliburProcessPlugin::CONFIG_IMAGE_HEIGHT = "height";
-  const std::string ExcaliburProcessPlugin::CONFIG_RESET_24_BIT = "reset";
   const std::string ExcaliburProcessPlugin::BIT_DEPTH[4] = {"1-bit", "6-bit", "12-bit", "24-bit"};
 
   /**
@@ -23,8 +22,7 @@ namespace FrameProcessor
       asic_counter_depth_(DEPTH_12_BIT),
       image_width_(2048),
       image_height_(256),
-      image_pixels_(image_width_ * image_height_),
-      frames_received_(0)
+      image_pixels_(image_width_ * image_height_)
   {
     // Setup logging for the class
     logger_ = Logger::getLogger("FW.ExcaliburProcessPlugin");
@@ -91,10 +89,6 @@ namespace FrameProcessor
 
     image_pixels_ = image_width_ * image_height_;
 
-    if (config.has_param(ExcaliburProcessPlugin::CONFIG_RESET_24_BIT))
-    {
-      frames_received_ = 0;
-    }
   }
 
   /**
@@ -155,11 +149,8 @@ namespace FrameProcessor
         static_cast<const char*>(frame->get_data()) + sizeof(Excalibur::FrameHeader)
     );
 
-    // Pointers to full and partial reordered images - will be allocated on demand
-
-    void * reordered_image = NULL;
-    void* reordered_part_image_c0 = NULL;
-    static void* reordered_part_image_c1 = NULL;
+    // Pointers to reordered image buffer - will be allocated on demand
+    void* reordered_image = NULL;
 
     try
     {
@@ -176,21 +167,17 @@ namespace FrameProcessor
         throw std::runtime_error(msg.str());
       }
 
-      // Allocate buffer to receive reordered image. In 24 bit mode only do this once the second
-      // frame containing C0 data has been received
-      if ((asic_counter_depth_ != DEPTH_24_BIT) || (frames_received_ == 1))
+      // Allocate buffer to receive reordered image.
+      reordered_image = (void*)malloc(output_image_size);
+      if (reordered_image == NULL)
       {
-        reordered_image = (void*)malloc(output_image_size);
-        if (reordered_image == NULL)
-        {
-          throw std::runtime_error("Failed to allocate temporary buffer for reordered image");
-        }
+        throw std::runtime_error("Failed to allocate temporary buffer for reordered image");
       }
 
       // Calculate the FEM frame size once so it can be used in the following loop
       // repeatedly
       std::size_t fem_frame_size = (
-          Excalibur::num_subframes *
+          Excalibur::num_subframes[asic_counter_depth_] *
           Excalibur::subframe_size(static_cast<Excalibur::AsicCounterBitDepth>(asic_counter_depth_))
       );
 
@@ -235,79 +222,18 @@ namespace FrameProcessor
                                  stripe_is_even);
             break;
 
-          case DEPTH_24_BIT: // 24-bit counter depth needs special handling to merge partial frames
+          case DEPTH_24_BIT: // 24-bit counter depth needs special handling to merge two counters
 
-            std::size_t partial_image_size = reordered_image_size(DEPTH_12_BIT);
+            void* c1_input_ptr = input_ptr;
+            void* c0_input_ptr =  static_cast<void *>(static_cast<char *>(input_ptr) + fem_frame_size / 2);
 
-            if (frames_received_ == 0)
-            {
-              // First frame contains C1 data, so allocate space if not already done, reorder and
-              // store the partial image for later use
-              if (reordered_part_image_c1 == NULL)
-              {
-                reordered_part_image_c1 = (void *)malloc(partial_image_size);
-                if (reordered_part_image_c1 == NULL)
-                {
-                  throw std::runtime_error(
-                      "Failed to allocate temporary buffer for 24-bit partial C1 image"
-                      );
-                }
-              }
+            reorder_24bit_stripe(
+                static_cast<unsigned short *>(c0_input_ptr),
+                static_cast<unsigned short *>(c1_input_ptr),
+                static_cast<unsigned int *>(reordered_image) + output_offset,
+                stripe_is_even);
 
-              reorder_12bit_stripe(static_cast<unsigned short *>(input_ptr),
-                  static_cast<unsigned short *>(reordered_part_image_c1) + output_offset,
-                  stripe_is_even);
-
-            }
-            else
-            {
-              // Second frame contains C0 data, allocate space for this if not already done,
-              // reorder and then build the full-depth output image
-              if (reordered_part_image_c0 == NULL)
-              {
-                reordered_part_image_c0 = (void *)malloc(partial_image_size);
-                if (reordered_part_image_c0 == NULL)
-                {
-                  throw std::runtime_error(
-                      "Failed to allocate temporary buffer for 24-bit partial C0 image"
-                      );
-                }
-              }
-
-              // Reorder received buffer into C0
-              reorder_12bit_stripe(static_cast<unsigned short *>(input_ptr),
-                  static_cast<unsigned short *>(reordered_part_image_c0) + output_offset,
-                  stripe_is_even);
-
-            }
             break;
-        }
-      }
-
-      // Handle 24-bit switching of partial images outside the active FEM loop, building the full
-      // 24-bit image into the reordered image buffer when both partial images have been received.
-      if (asic_counter_depth_ == DEPTH_24_BIT)
-      {
-        if (frames_received_ == 0)
-        {
-          // Set the frames switch ready for the second frame
-          frames_received_ = 1;
-        }
-        else
-        {
-          // Build 24 bit image into output buffer
-          build_24bit_image((unsigned short *)reordered_part_image_c0,
-                            (unsigned short *)reordered_part_image_c1,
-                            (unsigned int*)reordered_image, image_pixels_);
-
-          // Free the partial image buffers as no longer needed
-          free(reordered_part_image_c0);
-          reordered_part_image_c0 = NULL;
-          free(reordered_part_image_c1);
-          reordered_part_image_c1 = NULL;
-
-          // Reset the frames switch
-          frames_received_ = 0;
         }
       }
 
@@ -348,6 +274,44 @@ namespace FrameProcessor
   }
 
   /**
+   * Determine the size of a reordered image size based on the counter depth.
+   *
+   * \param[in] asic_counter_depth
+   * \return size of the reordered image in bytes
+   */
+  std::size_t ExcaliburProcessPlugin::reordered_image_size(int asic_counter_depth) {
+
+    std::size_t slice_size = 0;
+
+    switch (asic_counter_depth)
+    {
+      case DEPTH_1_BIT:
+      case DEPTH_6_BIT:
+        slice_size = image_width_ * image_height_ * sizeof(unsigned char);
+        break;
+
+      case DEPTH_12_BIT:
+        slice_size = image_width_ * image_height_ * sizeof(unsigned short);
+        break;
+
+      case DEPTH_24_BIT:
+        slice_size = image_width_ * image_height_ * sizeof(unsigned int);
+        break;
+
+      default:
+      {
+        std::stringstream msg;
+        msg << "Invalid bit depth specified for reordered slice size: " << asic_counter_depth;
+        throw std::runtime_error(msg.str());
+      }
+      break;
+    }
+
+    return slice_size;
+
+  }
+
+  /**
    * Reorder an image stripe using 1 bit re-ordering.
    * 1 bit images are captured in raw data mode, i.e. without reordering. In this mode, each
    * 32-bit word contains the current pixel being output on each data line of the group of
@@ -355,6 +319,7 @@ namespace FrameProcessor
    *
    * \param[in] in - Pointer to the incoming image data.
    * \param[out] out - Pointer to the allocated memory where the reordered image is written.
+   * \param[in] stripe_is_even - boolean indicating if stripe has even orientation
    */
   void ExcaliburProcessPlugin::reorder_1bit_stripe(unsigned int* in, unsigned char* out,
       bool stripe_is_even)
@@ -408,6 +373,7 @@ namespace FrameProcessor
    *
    * \param[in] in - Pointer to the incoming image data.
    * \param[out] out - Pointer to the allocated memory where the reordered image is written.
+   * \param[in] stripe_is_even - boolean indicating if stripe has even orientation
    */
   void ExcaliburProcessPlugin::reorder_6bit_stripe(unsigned char* in, unsigned char* out,
       bool stripe_is_even)
@@ -459,6 +425,8 @@ namespace FrameProcessor
    *
    * \param[in] in - Pointer to the incoming image data.
    * \param[out] out - Pointer to the allocated memory where the reordered image is written.
+   * \param[in] stripe_is_even - boolean indicating if stripe has even orientation
+   *
    */
   void ExcaliburProcessPlugin::reorder_12bit_stripe(unsigned short* in, unsigned short* out,
       bool stripe_is_even)
@@ -502,52 +470,57 @@ namespace FrameProcessor
   }
 
   /**
-   * Build a 24bit image from two partial images.
-   *
-   * \param[in] inC0 - Pointer to the incoming first image data.
-   * \param[in] inC1 - Pointer to the incoming second image data.
-   * \param[out] out - Pointer to the allocated memory where the combined image is written.
-   */
-  void ExcaliburProcessPlugin::build_24bit_image(
-      unsigned short* inC0, unsigned short* inC1, unsigned int* out, int num_pixels)
-  {
-    int addr;
-    for (addr = 0; addr < num_pixels; addr++)
+     * Reorder an image stripe using 24 bit re-ordering.
+     *
+     * This method uses the same reordering algorithm as for 12-bit images, but reorders
+     * both counters in parallel and builds into the output image.
+     *
+     * \param[in] in_c0 - Pointer to the incoming counter 0 data.
+     * \param[in] in_c1 - Pointer to the incoming counter 1 data.
+     * \param[out] out - Pointer to the allocated memory where the reordered image is written.
+     * \param[in] stripe_is_even - boolean indicating if stripe has even orientation
+     */
+    void ExcaliburProcessPlugin::reorder_24bit_stripe(unsigned short* in_c0,
+        unsigned short* in_c1, unsigned int* out, bool stripe_is_even)
     {
-      out[addr] = (((unsigned int)(inC1[addr] & 0xFFF)) << 12) | (inC0[addr] & 0xFFF);
-    }
-  }
+      int block, y, x, chip, x2, pixel_x, pixel_y, pixel_addr;
+      int raw_addr = 0;
 
-  std::size_t ExcaliburProcessPlugin::reordered_image_size(int asic_counter_depth) {
-
-    std::size_t slice_size = 0;
-
-    switch (asic_counter_depth)
-    {
-      case DEPTH_1_BIT:
-      case DEPTH_6_BIT:
-        slice_size = image_width_ * image_height_ * sizeof(unsigned char);
-        break;
-
-      case DEPTH_12_BIT:
-        slice_size = image_width_ * image_height_ * sizeof(unsigned short);
-        break;
-
-      case DEPTH_24_BIT:
-        slice_size = image_width_ * image_height_ * sizeof(unsigned int);
-        break;
-
-      default:
+      for (block=0; block<FEM_BLOCKS_PER_STRIPE_X; block++)
       {
-        std::stringstream msg;
-        msg << "Invalid bit depth specified for reordered slice size: " << asic_counter_depth;
-        throw std::runtime_error(msg.str());
+        for (y=0; y<FEM_PIXELS_PER_CHIP_Y; y++)
+        {
+          pixel_y = stripe_is_even ? (255 - y) : y;
+
+          for (x=0; x<FEM_PIXELS_PER_CHIP_X/FEM_PIXELS_IN_GROUP_12BIT; x++)
+          {
+            for (chip=0; chip<FEM_CHIPS_PER_BLOCK_X; chip++)
+            {
+              for (x2=0; x2<FEM_PIXELS_IN_GROUP_12BIT; x2++)
+              {
+                if (stripe_is_even)
+                {
+                  pixel_x = (block*(FEM_PIXELS_PER_CHIP_X*FEM_CHIPS_PER_STRIPE_X/2) +
+                         chip*FEM_PIXELS_PER_CHIP_X + (255-(x2 + x*FEM_PIXELS_IN_GROUP_12BIT)));
+                }
+                else
+                {
+                  pixel_x = (FEM_PIXELS_PER_CHIP_X*FEM_CHIPS_PER_STRIPE_X - 1) -
+                      (block*(FEM_PIXELS_PER_CHIP_X*FEM_CHIPS_PER_STRIPE_X/2) +
+                       chip*FEM_PIXELS_PER_CHIP_X + (255-(x2 + x*FEM_PIXELS_IN_GROUP_12BIT)));
+                }
+                pixel_addr = pixel_x + pixel_y*(FEM_PIXELS_PER_CHIP_X*FEM_CHIPS_PER_STRIPE_X);
+                out[pixel_addr] =
+                    (((unsigned int)(in_c1[raw_addr] & 0xFFF)) << 12) | (in_c0[raw_addr] & 0xFFF);
+                raw_addr++;
+              }
+            }
+          }
+        }
+        // Skip over the subframe trailer in the last 8 bytes (4 words) at the end of each block
+        raw_addr += 4;
       }
-      break;
     }
 
-    return slice_size;
-
-  }
-} /* namespace filewriter */
+} /* namespace FrameProcessor */
 

@@ -349,6 +349,11 @@ void ExcaliburFemClient::command(unsigned int aCommand)
       this->stopAcquisition();
       break;
 
+    case FEM_OP_RESET_UDP_COUNTER:
+      FEMLOG(mFemId, logDEBUG) << "Resetting UDP frame counter";
+      this->asicControlUdpCounterReset();
+      break;
+
     default:
       theCommand = aCommand;
       FemClient::command(theCommand);
@@ -479,11 +484,13 @@ void ExcaliburFemClient::startAcquisition(void)
   // Reset the 10GigE UDP counters on the FEM unless this is a matrix read of counter 0 in 24-bit
   // mode, in which case the frame counter should increment
 
-  if ((mMpx3OmrParams[0].counterDepth == counterDepth24) &&
-      (mOperationMode == excaliburOperationModeMatrixRead) &&
-      (mMpx3CounterSelect == mpx3Counter0))
+//  if ((mMpx3OmrParams[0].counterDepth == counterDepth24) &&
+//      (mOperationMode == excaliburOperationModeMatrixRead) &&
+//      (mMpx3CounterSelect == mpx3Counter0))
+  if (mMpx3OmrParams[0].counterDepth == counterDepth24)
   {
-    FEMLOG(mFemId, logDEBUG) << "Not resetting UDP frame counter in 24-bit C0 read acquisition";
+//    FEMLOG(mFemId, logDEBUG) << "Not resetting UDP frame counter in 24-bit C0 read acquisition";
+    FEMLOG(mFemId, logDEBUG) << "Not resetting UDP frame counter in 24-bit acquisition";
   }
   else
   {

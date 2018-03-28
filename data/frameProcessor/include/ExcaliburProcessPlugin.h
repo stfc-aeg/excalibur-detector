@@ -88,7 +88,8 @@ namespace FrameProcessor
     void reorder_1bit_stripe(unsigned int* in, unsigned char* out, bool stripe_is_even);
     void reorder_6bit_stripe(unsigned char* in, unsigned char* out, bool stripe_is_even);
     void reorder_12bit_stripe(unsigned short* in, unsigned short* out, bool stripe_is_even);
-    void build_24bit_image(unsigned short* inC0, unsigned short* inC1, unsigned int* out, int num_pixels);
+    void reorder_24bit_stripe(unsigned short* in_c0, unsigned short* in_c1, unsigned int* out,
+        bool stripe_is_even);
     std::size_t reordered_image_size(int asic_counter_depth_);
 
     /** Pointer to logger **/
@@ -101,8 +102,6 @@ namespace FrameProcessor
     int image_height_;
     /** Image pixel count **/
     int image_pixels_;
-    /** Counter used for construction of 24 bit frames **/
-    int frames_received_;
   };
 
   /**

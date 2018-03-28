@@ -815,13 +815,34 @@ class ExcaliburTestApp(object):
             if self.args.burst_mode:
                 logging.warning('Cannot select burst mode and matrix read simultaneously, ignoring burst option')
             operation_mode =  ExcaliburDefinitions.FEM_OPERATION_MODE_MAXTRIXREAD
+
+        acq_loops = 1
+        num_frames = self.args.num_frames
            
-        # Force counter select to C1 for 24 bit read. C0 is read manually afterwards
+        # 24-bit reads are a special case, so set things up appropriately in this mode    
         if self.args.counter_depth == 24:
+
+            # Force counter select to C1, C0 is read manually afterwards
             self.args.counter_select = 1 
         
-        logging.info('Executing acquisition ...')
-        
+            # For acquisitions with > 1 frame, run multiple acquisition loops instea
+            acq_loops = num_frames
+            num_frames = 1
+            if acq_loops > 1:
+                logging.info("Configuring 24-bit acquisition with {} 1-frame loops".format(acq_loops))
+            
+            # Disable no_wait mode if requested
+            if self.args.no_wait:
+                logging.info("Disabling no-wait mode for 24-bit acquisition")
+                self.args.no_wait = False
+                
+            # In 24-bit mode, force a reset of the UDP frame counter before first acquisition loop
+            logging.info('Resetting UDP frame counter for 24 bit mode')
+            cmd_ok = self.client.do_command('reset_udp_counter')
+            if not cmd_ok:
+                logging.error("UDP counter reset failed: {}".format(self.client.error_msg))
+                return
+
         # Build a list of parameters to be written to the system to set up acquisition
         write_params = []
                 
@@ -830,8 +851,8 @@ class ExcaliburTestApp(object):
         tp_enable = 1 if self.args.tp_count != 0 else 0
         write_params.append(ExcaliburParameter('testpulse_enable', [[tp_enable]]))
         
-        logging.info('  Setting number of frames to {}'.format(self.args.num_frames))
-        write_params.append(ExcaliburParameter('num_frames_to_acquire', [[self.args.num_frames]]))
+        logging.info('  Setting number of frames to {}'.format(num_frames))
+        write_params.append(ExcaliburParameter('num_frames_to_acquire', [[num_frames]]))
         
         logging.info('  Setting acquisition time to {} ms'.format(self.args.acquisition_time))
         write_params.append(ExcaliburParameter('acquisition_time', [[self.args.acquisition_time]]))
@@ -895,37 +916,48 @@ class ExcaliburTestApp(object):
         # Disable local receiver thread
         logging.info('  Disabling local data receiver thread')
         write_params.append(ExcaliburParameter('datareceiver_enable', [[0]]))
-
-        # Write all the parameters to system
-        logging.info('Writing configuration parameters to system')
-        write_ok = self.client.fe_param_write(write_params)
-        if not write_ok:
-            logging.error('Failed to write configuration parameters to system: {}'.format(self.client.error_msg))
-            return
-
-        # Send start acquisition command
-        logging.info('Sending start acquisition command')
-        cmd_ok = self.client.do_command('start_acquisition')
-        if not cmd_ok:
-            logging.error('start_acquisition command failed: {}'.format(self.client.error_msg))
-            return
-        
-        # If the nowait arguments wasn't given, monitor the acquisition state until all requested frames
-        # have been read out by the system
-        if not self.args.no_wait:
-
-            frames_acquired = self.await_acquistion_completion(0x40000000)
-            
-            if self.args.counter_depth == 24:
-                self.client.do_command('stop_acquisition')
-                self.do_c0_matrix_read()
-            
-            self.do_stop()
-
-            logging.info('Acquistion of {} frames completed'.format(frames_acquired))
-        else:
-            logging.info('Acquisition started, not waiting for completion, will not send stop command')
     
+        for acq_loop in range(acq_loops):
+        
+            logging.info(
+                'Executing acquisition loop {} of {}...'.format(acq_loop+1, acq_loops)
+            )
+            
+            # Write all the parameters to system
+            logging.info('Writing configuration parameters to system')
+            write_ok = self.client.fe_param_write(write_params)
+            if not write_ok:
+                logging.error('Failed to write configuration parameters to system: {}'.format(self.client.error_msg))
+                return
+
+            # Send start acquisition command
+            logging.info('Sending start acquisition command')
+            cmd_ok = self.client.do_command('start_acquisition')
+            if not cmd_ok:
+                logging.error('start_acquisition command failed: {}'.format(self.client.error_msg))
+                return
+            
+            # If the nowait arguments wasn't given, monitor the acquisition state until all requested frames
+            # have been read out by the system
+            if not self.args.no_wait:
+    
+                frames_acquired = self.await_acquistion_completion(0x40000000)
+                
+                if self.args.counter_depth == 24:
+                    self.client.do_command('stop_acquisition')
+                    self.do_c0_matrix_read()
+                
+                self.do_stop()
+    
+                logging.info('Acquistion of {} frame{} completed'.format(
+                    frames_acquired, "s" if frames_acquired > 1 else ""
+                ))
+            else:
+                logging.info('Acquisition started, not waiting for completion, will not send stop command')
+        
+        if acq_loops > 1:
+            logging.info("Completed {} acquisition loops".format(acq_loops))
+                
     def do_c0_matrix_read(self):
 
         logging.info('Performing a C0 matrix read for 24 bit mode')
@@ -953,7 +985,7 @@ class ExcaliburTestApp(object):
             return
 
         self.await_acquistion_completion(0x1f)
-        self.client.do_command('stop_acquisition')
+        # self.client.do_command('stop_acquisition')
     
     def await_acquistion_completion(self, acq_completion_state_mask):
         
@@ -962,7 +994,7 @@ class ExcaliburTestApp(object):
                 
         while True:
             
-            (read_ok, vals) = self.client.fe_param_read(['frames_acquired','control_state'])
+            (_, vals) = self.client.fe_param_read(['frames_acquired','control_state'])
             frames_acquired = min(vals['frames_acquired'])
             acq_completed = all(
                 [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]

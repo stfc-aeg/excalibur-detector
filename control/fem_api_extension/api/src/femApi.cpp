@@ -1188,6 +1188,10 @@ int femCmd(void* handle, int chipId, int id)
         (femHandle->client)->command(0);
         break;
 
+      case FEM_OP_RESET_UDP_COUNTER:
+        (femHandle->client)->command(id);
+        break;
+
       default:
         (femHandle->error).set() << "Illegal command id (" << id << ") specified";
         rc = FEM_RTN_UNKNOWNOPID;

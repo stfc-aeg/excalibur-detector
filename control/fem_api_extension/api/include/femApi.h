@@ -161,6 +161,7 @@ extern "C"
 #define FEM_OP_LOADDACCONFIG 5
 #define FEM_OP_FEINIT 6
 #define FEM_OP_REBOOT 7
+#define FEM_OP_RESET_UDP_COUNTER 8
 
 /* Medipix III global registers */
 #define FEM_OP_MPXIII_COLOURMODE 1000
