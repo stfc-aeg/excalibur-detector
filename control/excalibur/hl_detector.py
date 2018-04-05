@@ -927,8 +927,14 @@ class HLExcaliburDetector(ExcaliburDetector):
         params.append(ExcaliburParameter('fe_hv_bias', [[value]], fem=self.powercard_fem_idx+1))
         self.hl_write_params(params)
 
+    def hl_start_acquisition(self):
+        with self._comms_lock:
+            self.do_command('start_acquisition', None)
+            return self.wait_for_completion()
+
     def hl_stop_acquisition(self):
         with self._comms_lock:
+            self._acquiring = False
             self.do_command('stop_acquisition', None)
             return self.wait_for_completion()
 
@@ -936,6 +942,40 @@ class HLExcaliburDetector(ExcaliburDetector):
         with self._comms_lock:
             self.write_fe_param(params)
             return self.wait_for_completion()
+
+    def hl_efuseid_read(self):
+        efuse_dict = {'efuseid_c0': [],
+                      'efuseid_c1': [],
+                      'efuseid_c2': [],
+                      'efuseid_c3': [],
+                      'efuseid_c4': [],
+                      'efuseid_c5': [],
+                      'efuseid_c6': [],
+                      'efuseid_c7': []}
+        fe_params = ['efuseid']
+        read_params = ExcaliburReadParameter(fe_params)
+        self.read_fe_param(read_params)
+
+        while True:
+            time.sleep(0.1)
+            if not self.command_pending():
+                if self._get('command_succeeded'):
+                    logging.info("Command has succeeded")
+                    status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read']['value']
+                    #logging.error("Status: %s", status)
+                    for efuse in status['efuseid']:
+                        efuse_dict['efuseid_c0'].append(efuse[0])
+                        efuse_dict['efuseid_c1'].append(efuse[1])
+                        efuse_dict['efuseid_c2'].append(efuse[2])
+                        efuse_dict['efuseid_c3'].append(efuse[3])
+                        efuse_dict['efuseid_c4'].append(efuse[4])
+                        efuse_dict['efuseid_c5'].append(efuse[5])
+                        efuse_dict['efuseid_c6'].append(efuse[6])
+                        efuse_dict['efuseid_c7'].append(efuse[7])
+                break
+
+        logging.error("EFUSE: %s", efuse_dict)
+        return efuse_dict
 
     def get_fem_error_state(self):
         fem_state = self.get('status/fem')['fem']
