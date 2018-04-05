@@ -134,15 +134,6 @@ class HLExcaliburDetector(ExcaliburDetector):
     def __init__(self, fem_connections):
         super(HLExcaliburDetector, self).__init__(fem_connections)
 
-        # Temporary setup of MAC addresses
-#        self.source_data_addr = [u'10.0.2.2']
-#        self.source_data_mac = [u'62:00:00:00:00:01']
-#        self.source_data_port = [8]
-#        self.dest_data_addr = [u'10.0.2.1']
-#        self.dest_data_mac = [u'00:07:43:06:31:A7']
-#        self.dest_data_mac = [u'A0:36:9F:8C:52:3C']
-#        self.dest_data_mac = [u'00:07:43:11:F7:60', u'A0:36:9F:8C:52:3C']
-#        self.dest_data_port = [61649]
         self._fems = range(1, len(fem_connections)+1)
         logging.debug("Fem conection IDs: %s", self._fems)
 
