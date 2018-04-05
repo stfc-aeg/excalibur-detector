@@ -71,11 +71,12 @@ class Parameter(object):
                         }
         return return_value
 
-    def set_value(self, value):
+    def set_value(self, value, callback=True):
         if self._value != value:
             self._value = value
             if self._callback is not None:
-                self._callback(self._name, self._value)
+                if callback:
+                    self._callback(self._name, self._value)
 
 
 class EnumParameter(Parameter):
@@ -148,7 +149,10 @@ class HLExcaliburDetector(ExcaliburDetector):
             'config/num_test_pulses': IntegerParameter('num_test_pulses', 0),
             'config/test_pulse_enable': EnumParameter('test_pulse_enable',
                                                       ExcaliburDefinitions.FEM_TEST_PULSE_NAMES[0],
-                                                   ExcaliburDefinitions.FEM_TEST_PULSE_NAMES),
+                                                      ExcaliburDefinitions.FEM_TEST_PULSE_NAMES),
+            'config/image_mode': EnumParameter('image_mode',
+                                               ExcaliburDefinitions.FEM_IMAGEMODE_NAMES[0],
+                                               ExcaliburDefinitions.FEM_IMAGEMODE_NAMES),
             'config/operation_mode': EnumParameter('operation_mode',
                                                    ExcaliburDefinitions.FEM_OPERATION_MODE_NAMES[0],
                                                    ExcaliburDefinitions.FEM_OPERATION_MODE_NAMES),
@@ -186,6 +190,8 @@ class HLExcaliburDetector(ExcaliburDetector):
             'config/energy_threshold': DoubleParameter('energy_threshold', 0.0, callback=self.update_calibration),
             'config/udp_file': StringParameter('udp_file', '', callback=self.hl_load_udp_config),
             'config/hv_bias': DoubleParameter('hv_bias', 0.0, callback=self.hl_hv_bias_set),
+            'config/lv_enable': IntegerParameter('lv_enable', 0, callback=self.hl_lv_enable),
+            'config/hv_enable': IntegerParameter('hv_enable', 0, callback=self.hl_hv_enable),
 
             #["Normal",
             #                                                                     "Burst",
@@ -214,7 +220,10 @@ class HLExcaliburDetector(ExcaliburDetector):
         }
 
         self._executing_updates = True
+        self._read_efuse_ids = False
         self._acquiring = False
+        self._frames_acquired = 0
+        self._hw_frames_acquired = 0
         self._acq_frame_count = 0
         self._acq_exposure = 0.0
         self._acq_start_time = datetime.now()
@@ -340,11 +349,11 @@ class HLExcaliburDetector(ExcaliburDetector):
         self.download_dac_calibration()
         logging.error("Status: %s", self._status)
 
-    def hl_manual_mask_calibration(self, filename):
+    def hl_test_mask_calibration(self, filename):
         for fem in self._fems:
             self.set_calibration_status(fem, 0, 'mask')
         self._cb.manual_mask_calibration(self._fems, filename)
-        self.download_pixel_masks()
+        self.download_test_masks()
         logging.error("Status: %s", self._status)
 
     def update_calibration(self, name, value):
@@ -382,7 +391,7 @@ class HLExcaliburDetector(ExcaliburDetector):
 
         # Write all the parameters to system
         logging.info('Writing DAC configuration parameters to system {}'.format(str(dac_params)))
-        self.write_fe_param(dac_params)
+        self.hl_write_params(dac_params)
 
         for fem in self._fems:
             self.set_calibration_status(fem, 1, 'dac')
@@ -447,12 +456,8 @@ class HLExcaliburDetector(ExcaliburDetector):
         pixel_params.append(ExcaliburParameter('mpx3_pixel_disch', mpx3_pixel_disch,
                                                fem=self._fems, chip=chip_ids))
 
-        #pixel_params.append(ExcaliburParameter('mpx3_pixel_test', [[mpx3_pixel_test]],
-        #                                       fem=self.args.config_fem,
-        #                                       chip=self.args.config_chip))
-
         # Write all the parameters to system
-        self.write_fe_param(pixel_params)
+        self.hl_write_params(pixel_params)
         for fem in self._fems:
             self.set_calibration_status(fem, 1, 'mask')
             self.set_calibration_status(fem, 1, 'discl')
@@ -463,7 +468,7 @@ class HLExcaliburDetector(ExcaliburDetector):
         # Fast poll is currently set to 0.2 s
         # Slow poll is currently set to 5.0 s
         while self._executing_updates:
-            if (datetime.now() - self._slow_update_time).seconds > 5.0:
+            if (datetime.now() - self._slow_update_time).seconds > 10.0:
                 self._slow_update_time = datetime.now()
                 self.slow_read()
             if (datetime.now() - self._medium_update_time).seconds > 10.0:
@@ -477,10 +482,6 @@ class HLExcaliburDetector(ExcaliburDetector):
     def get(self, path):
         with self._param_lock:
             if path == 'command/initialise':
-                response = {'value': 1}
-            elif path == 'command/lv_enable':
-                response = {'value': 1}
-            elif path == 'command/hv_enable':
                 response = {'value': 1}
             elif path == 'command/configure_dac':
                 response = {'value': 1}
@@ -508,14 +509,6 @@ class HLExcaliburDetector(ExcaliburDetector):
                 # Initialise the FEMs
                 logging.error('Initialise has been called')
                 self.hl_initialise()
-            elif path == 'command/lv_enable':
-                # Disable/Enable the low voltage
-                logging.error('lv_enable has been called')
-                self.hl_lv_enable(data)
-            elif path == 'command/hv_enable':
-                # Disable/Enable the low voltage
-                logging.error('hv_enable has been called')
-                self.hl_hv_enable(data)
             elif path == 'command/configure_dac':
                 # Initialise the FEMs
                 logging.error('Manual DAC calibration has been called')
@@ -523,15 +516,16 @@ class HLExcaliburDetector(ExcaliburDetector):
             elif path == 'command/configure_mask':
                 # Initialise the FEMs
                 logging.error('Manual mask file download has been called')
-                self.hl_manual_mask_calibration(data)
+                self.hl_test_mask_calibration(data)
             elif path == 'command/start_acquisition':
                 # Starting an acquisition!
                 logging.debug('Start acquisition has been called')
+                self.hl_arm_detector()
                 self.do_acquisition()
             elif path == 'command/stop_acquisition':
                 # Starting an acquisition!
                 logging.debug('Abort acquisition has been called')
-                self.do_command('stop_acquisition', None)
+                self.hl_stop_acquisition()
             else:
                 super(HLExcaliburDetector, self).set(path, data)
         except Exception as ex:
@@ -584,10 +578,13 @@ class HLExcaliburDetector(ExcaliburDetector):
             logging.info("Raw fast read status: %s", vals)
             # Calculate the minimum number of frames from the fems, as this will be the actual complete frame count
             frames_acquired = min(vals['frames_acquired'])
+            self._hw_frames_acquired = frames_acquired
             #acq_completed = all(
             #    [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]
             #)
             if self._acquiring:
+                # Record the frames acquired
+                self._frames_acquired = frames_acquired
                 # We are acquiring so check to see if we have the correct number of frames
                 if frames_acquired == self._acq_frame_count:
                     self._acquiring = False
@@ -619,14 +616,21 @@ class HLExcaliburDetector(ExcaliburDetector):
                     delta_t -= 1.0
                     if delta_t > 0.0:
                         expected_frames = int(delta_t / (self._acq_exposure * 1.1))
-                        #logging.error("We would have expected %d frames by now", expected_frames)
+                        logging.debug("We would have expected %d frames by now", expected_frames)
                         if expected_frames > frames_acquired:
                             self._acquiring = False
                             # Acquisition has finished so we must send the stop command
+                            self.set_error("stop_acquisition called due to a timeout")
                             logging.debug("stop_acquisition called due to a timeout")
                             self.hl_stop_acquisition()
 
-            status = {'frames_acquired': frames_acquired,
+            init_state = []
+            for fem_state in self.get('status/fem')['fem']:
+                init_state.append(fem_state['state'])
+
+            status = {'fem_state': init_state,
+                      'frames_acquired': self._frames_acquired,
+                      'fem_frames': vals['frames_acquired'],
                       'frame_rate': frame_rate,
                       'acquisition_complete': (not self._acquiring)}
         with self._param_lock:
@@ -684,6 +688,14 @@ class HLExcaliburDetector(ExcaliburDetector):
                             status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read'][
                                 'value']
                             with self._param_lock:
+                                # Check for the current HV enabled state
+                                hv_enabled = 0
+                                # Greater than 100.0 Volts means the HV is enabled
+                                #logging.error('Value of pwr_bias_vmon: %s', status['pwr_bias_vmon'])
+                                if status['pwr_bias_vmon'][0] > 100.0:
+                                    hv_enabled = 1
+                                self._param['config/hv_enable'].set_value(hv_enabled, callback=False)
+
                                 for param in powercard_params:
                                     if param in status:
                                         val = status[param]
@@ -697,7 +709,7 @@ class HLExcaliburDetector(ExcaliburDetector):
                                 for param in powercard_params:
                                     self._status[param] = None
                         break
-        logging.debug("Power card update status: %s", self._status)
+                logging.debug("Power card update status: %s", self._status)
 
     def slow_read(self):
         status = {}
@@ -725,6 +737,7 @@ class HLExcaliburDetector(ExcaliburDetector):
                             status = super(HLExcaliburDetector, self).get('command')['command']['fe_param_read'][
                                 'value']
                             with self._param_lock:
+                                lv_enabled = 1
                                 for param in fe_params:
                                     if param in status:
                                         val = []
@@ -735,8 +748,17 @@ class HLExcaliburDetector(ExcaliburDetector):
                                                 else:
                                                     val.append(1)
                                         else:
-                                            val = status[param]
+                                            if param == 'moly_temp' or param == 'moly_humidity':
+                                                for item in status[param]:
+                                                    if item < 0.0:
+                                                        val.append(None)
+                                                        lv_enabled = 0
+                                                    else:
+                                                        val.append(item)
+                                            else:
+                                                val = status[param]
                                         self._status[param] = val
+                                self._param['config/lv_enable'].set_value(lv_enabled, callback=False)
                         else:
                             logging.info("Command has failed")
                             with self._param_lock:
@@ -745,14 +767,28 @@ class HLExcaliburDetector(ExcaliburDetector):
                                         self._status[param] = status[param]
                         break
 
-        logging.debug("Slow update status: %s", status)
+                if not self._read_efuse_ids:
+                    self._status.update(self.hl_efuseid_read())
+                    self._read_efuse_ids = True
+
+                logging.debug("Slow update status: %s", self._status)
+
+    def hl_arm_detector(self):
+        # Perform all of the actions required to get the detector ready for an acquisition
+        with self._comms_lock:
+            self.clear_error()
+
+            # Start by downloading the UDP configuration
+            self.hl_load_udp_config('arming', self._param['config/udp_file'].value)
+
 
     def do_acquisition(self):
         with self._comms_lock:
             self.clear_error()
-            if self._status['frames_acquired'] > 0:
+            if self._hw_frames_acquired > 0:
                 self.set_error('Detector reports non zero frames, reset detector')
                 return
+
             # Set the acquiring flag
             self._acquiring = True
             self._acq_start_time = datetime.now()
@@ -782,6 +818,13 @@ class HLExcaliburDetector(ExcaliburDetector):
             write_params.append(ExcaliburParameter('testpulse_enable', [[tp_enable.index]]))
 
             num_frames = self._param['config/num_images'].value
+            image_mode = self._param['config/image_mode'].value
+            logging.error('  Image mode set to {}'.format(image_mode))
+            # Check for single image mode
+            if image_mode == ExcaliburDefinitions.FEM_IMAGEMODE_NAMES[0]:
+                # Single image mode requested, set num frames to 1
+                logging.info('  Single image mode, setting number of frames to 1')
+                num_frames = 1
             logging.info('  Setting number of frames to {}'.format(num_frames))
             write_params.append(ExcaliburParameter('num_frames_to_acquire', [[num_frames]]))
 
@@ -860,7 +903,7 @@ class HLExcaliburDetector(ExcaliburDetector):
             # self.connect({'state': True})
 
             # Write all the parameters to system
-            logging.info('Writing configuration parameters to system {}'.format(str(write_params)))
+            logging.debug('Writing configuration parameters to system {}'.format(str(write_params)))
             self.hl_write_params(write_params)
 
             self._frame_start_count = 0
@@ -868,58 +911,25 @@ class HLExcaliburDetector(ExcaliburDetector):
 
             # Send start acquisition command
             logging.info('Sending start acquisition command')
-            self.do_command('start_acquisition', params=None)
-            # if not cmd_ok:
-            #     logging.error('start_acquisition command failed: {}'.format(self.client.error_msg))
-            #     return
-            #
-            # # If the nowait arguments wasn't given, monitor the acquisition state until all requested frames
-            # # have been read out by the system
-            # if not self.args.no_wait:
-            #
-            #     wait_count = 0
-            #     acq_completion_state_mask = 0x40000000
-            #     frames_acquired = 0
-            #
-            #     while True:
-            #
-            #         (read_ok, vals) = self.client.fe_param_read(['frames_acquired', 'control_state'])
-            #         frames_acquired = min(vals['frames_acquired'])
-            #         acq_completed = all(
-            #             [((state & acq_completion_state_mask) == acq_completion_state_mask) for state in vals['control_state']]
-            #         )
-            #         if acq_completed:
-            #             break
-            #
-            #         wait_count += 1
-            #         if wait_count % 5 == 0:
-            #             logging.info('  {:d} frames read out  ...'.format(frames_acquired))
-            #
-            #     logging.info('Completed readout of {} frames'.format(frames_acquired))
-            #     self.do_stop()
-            #     logging.info('Acquisition complete')
-            # else:
-            #     logging.info('Acquisition started, not waiting for completion, will not send stop command')
-
-#    def read_ini_file(self):
+            self.hl_start_acquisition()
 
     def hl_initialise(self):
         self.do_command('fe_init', params=None)
         return self.wait_for_completion()
 
-    def hl_lv_enable(self, lv_enable):
-
+    def hl_lv_enable(self, name, lv_enable):
+        logging.error("Setting lv_enable to %d", lv_enable)
         if self.powercard_fem_idx <= 0:
-            self.set_error("Unable to set LV enable as server reports no power card")
+            self.set_error("Unable to set LV enable [] as server reports no power card".format(name))
             return
         params = []
         params.append(ExcaliburParameter('fe_lv_enable', [[lv_enable]], fem=self.powercard_fem_idx+1))
         self.hl_write_params(params)
 
-    def hl_hv_enable(self, hv_enable):
-
+    def hl_hv_enable(self, name, hv_enable):
+        logging.error("Setting hv_enable to %d", hv_enable)
         if self.powercard_fem_idx <= 0:
-            self.set_error("Unable to set HV enable as server reports no power card")
+            self.set_error("Unable to set HV enable [] as server reports no power card".format(name))
             return
         params = []
         params.append(ExcaliburParameter('fe_hv_enable', [[hv_enable]], fem=self.powercard_fem_idx+1))
