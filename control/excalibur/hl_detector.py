@@ -400,7 +400,23 @@ class HLExcaliburDetector(ExcaliburDetector):
                                                fem=self._fems, chip=chip_ids))
 
         # Write all the parameters to system
-        self.write_fe_param(pixel_params)
+        self.hl_write_params(pixel_params)
+        for fem in self._fems:
+            self.set_calibration_status(fem, 1, 'mask')
+
+    def download_test_masks(self):
+        chip_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        pixel_params = []
+        mpx3_pixel_masks = []
+        logging.debug("Generating mpx3_pixel_test...")
+        for fem in self._fems:
+            fem_vals = [self._cb.get_mask(fem)[chip-1].pixels for chip in chip_ids]
+            mpx3_pixel_masks.append(fem_vals)
+        pixel_params.append(ExcaliburParameter('mpx3_pixel_test', mpx3_pixel_masks,
+                                               fem=self._fems, chip=chip_ids))
+
+        # Write all the parameters to system
+        self.hl_write_params(pixel_params)
         for fem in self._fems:
             self.set_calibration_status(fem, 1, 'mask')
 
