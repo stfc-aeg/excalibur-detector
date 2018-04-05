@@ -19,6 +19,10 @@ class ExcaliburDefinitions(object):
     FEM_TRIGMODE_SYNC = 2
     FEM_TRIGMODE_NAMES = ('internal', 'external', 'extsync')
 
+    FEM_IMAGEMODE_SINGLE = 0
+    FEM_IMAGEMODE_MULTIPLE = 1
+    FEM_IMAGEMODE_NAMES = ('Single', 'Multiple')
+
     FEM_READOUT_MODE_SEQUENTIAL = 0
     FEM_READOUT_MODE_CONTINUOUS = 1
     FEM_READOUT_MODE_NAMES = ('sequential', 'continuous')
