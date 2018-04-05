@@ -91,6 +91,15 @@ namespace FrameProcessor
 
   }
 
+  void ExcaliburProcessPlugin::requestConfiguration(OdinData::IpcMessage& reply)
+  {
+    // Return the configuration of the process plugin
+    std::string base_str = get_name() + "/";
+    reply.set_param(base_str + ExcaliburProcessPlugin::CONFIG_ASIC_COUNTER_DEPTH, BIT_DEPTH[asic_counter_depth_]);
+    reply.set_param(base_str + ExcaliburProcessPlugin::CONFIG_IMAGE_WIDTH, image_width_);
+    reply.set_param(base_str + ExcaliburProcessPlugin::CONFIG_IMAGE_HEIGHT, image_height_);
+  }
+
   /**
    * Collate status information for the plugin.  The status is added to the status IpcMessage object.
    *

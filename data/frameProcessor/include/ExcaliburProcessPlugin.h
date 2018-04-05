@@ -61,6 +61,7 @@ namespace FrameProcessor
     ExcaliburProcessPlugin();
     virtual ~ExcaliburProcessPlugin();
     void configure(OdinData::IpcMessage& config, OdinData::IpcMessage& reply);
+    void requestConfiguration(OdinData::IpcMessage& reply);
     void status(OdinData::IpcMessage& status);
 
   private:
